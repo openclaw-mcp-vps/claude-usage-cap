@@ -1,103 +1,116 @@
+import { randomUUID } from "node:crypto";
+
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import { getSessionFromRequest } from "@/lib/auth";
-import { hasActiveSubscription } from "@/lib/lemonsqueezy";
-import {
-  createProjectForOwner,
-  getProjectForOwner,
-  listProjectsForOwner,
-  rotateProjectProxyKey,
-  updateProjectForOwner
-} from "@/lib/projects";
 
-const capSchema = z.object({
-  dailyCapUsd: z.number().min(0.5).max(50000),
-  weeklyCapUsd: z.number().min(0.5).max(50000),
-  monthlyCapUsd: z.number().min(0.5).max(50000)
+import { getUserFromRequest, isUserPaid } from "@/lib/auth";
+import { encryptSecret, generateOpaqueKey, hashSecret } from "@/lib/security";
+import {
+  deleteProject,
+  findProjectById,
+  listProjectsByUserId,
+  saveProject
+} from "@/lib/storage";
+import { limitStatus, usageSeries } from "@/lib/usage-tracker";
+import type { BillingCaps, Project } from "@/lib/types";
+
+const capsSchema = z.object({
+  dailyUsd: z.number().positive(),
+  weeklyUsd: z.number().positive(),
+  monthlyUsd: z.number().positive()
 });
 
 const createSchema = z.object({
-  name: z.string().min(2).max(80),
-  anthropicApiKey: z.string().min(20),
-  slackWebhookUrl: z
-    .string()
-    .url()
-    .includes("hooks.slack.com")
-    .optional()
-    .or(z.literal("")),
-  caps: capSchema
+  name: z.string().trim().min(2).max(80),
+  anthropicApiKey: z.string().trim().min(20),
+  slackWebhookUrl: z.string().url().trim().nullable().optional(),
+  caps: capsSchema
 });
 
-const patchSchema = z.object({
+const updateSchema = z.object({
   id: z.string().uuid(),
-  name: z.string().min(2).max(80).optional(),
-  anthropicApiKey: z.string().min(20).optional(),
-  slackWebhookUrl: z
-    .string()
-    .url()
-    .includes("hooks.slack.com")
-    .optional()
-    .or(z.literal("")),
-  caps: capSchema.partial().optional(),
-  rotateProxyKey: z.boolean().optional()
+  name: z.string().trim().min(2).max(80).optional(),
+  anthropicApiKey: z.string().trim().min(20).optional(),
+  slackWebhookUrl: z.string().url().trim().nullable().optional(),
+  caps: capsSchema.optional()
 });
 
-function validateCapConsistency(caps: {
-  dailyCapUsd: number;
-  weeklyCapUsd: number;
-  monthlyCapUsd: number;
-}): string | null {
-  if (caps.weeklyCapUsd < caps.dailyCapUsd) {
-    return "Weekly cap must be greater than or equal to daily cap.";
-  }
+const deleteSchema = z.object({
+  id: z.string().uuid()
+});
 
-  if (caps.monthlyCapUsd < caps.weeklyCapUsd) {
-    return "Monthly cap must be greater than or equal to weekly cap.";
-  }
+function normalizeCaps(caps: BillingCaps): BillingCaps {
+  const daily = Number(caps.dailyUsd.toFixed(2));
+  const weekly = Number(caps.weeklyUsd.toFixed(2));
+  const monthly = Number(caps.monthlyUsd.toFixed(2));
 
-  return null;
+  return {
+    dailyUsd: Math.max(daily, 0.01),
+    weeklyUsd: Math.max(weekly, daily),
+    monthlyUsd: Math.max(monthly, weekly)
+  };
 }
 
-async function requirePaidSession(request: NextRequest): Promise<
-  | {
-      email: string;
-    }
-  | NextResponse
-> {
-  const session = getSessionFromRequest(request);
+async function projectResponse(project: Project) {
+  const status = await limitStatus(project);
 
-  if (!session) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
-  const active = await hasActiveSubscription(session.email);
-
-  if (!active) {
-    return NextResponse.json(
-      { error: "Active subscription required." },
-      { status: 402 }
-    );
-  }
-
-  return session;
+  return {
+    id: project.id,
+    name: project.name,
+    proxyKeyPrefix: project.proxyKeyPrefix,
+    createdAt: project.createdAt,
+    updatedAt: project.updatedAt,
+    caps: project.caps,
+    totals: status.totals,
+    exceeded: status.exceeded,
+    slackWebhookConfigured: Boolean(project.slackWebhookUrl)
+  };
 }
 
 export async function GET(request: NextRequest) {
-  const sessionOrResponse = await requirePaidSession(request);
+  const user = await getUserFromRequest(request);
 
-  if (sessionOrResponse instanceof NextResponse) {
-    return sessionOrResponse;
+  if (!user) {
+    return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
   }
 
-  const projects = await listProjectsForOwner(sessionOrResponse.email);
-  return NextResponse.json({ projects });
+  const id = request.nextUrl.searchParams.get("id");
+
+  if (id) {
+    const project = await findProjectById(id);
+
+    if (!project || project.userId !== user.id) {
+      return NextResponse.json({ error: "Project not found." }, { status: 404 });
+    }
+
+    const summary = await projectResponse(project);
+    const series = await usageSeries(project.id, 30);
+
+    return NextResponse.json({
+      project: {
+        ...summary,
+        slackWebhookUrl: project.slackWebhookUrl,
+        usageSeries: series,
+        proxyEndpoint: `${request.nextUrl.origin}/api/proxy`
+      }
+    });
+  }
+
+  const projects = await listProjectsByUserId(user.id);
+  const summaries = await Promise.all(projects.map((item) => projectResponse(item)));
+
+  return NextResponse.json({ projects: summaries });
 }
 
 export async function POST(request: NextRequest) {
-  const sessionOrResponse = await requirePaidSession(request);
+  const user = await getUserFromRequest(request);
 
-  if (sessionOrResponse instanceof NextResponse) {
-    return sessionOrResponse;
+  if (!user) {
+    return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
+  }
+
+  if (!isUserPaid(user)) {
+    return NextResponse.json({ error: "Active subscription required." }, { status: 402 });
   }
 
   let body: unknown;
@@ -105,49 +118,50 @@ export async function POST(request: NextRequest) {
   try {
     body = await request.json();
   } catch {
-    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
   }
 
   const parsed = createSchema.safeParse(body);
 
   if (!parsed.success) {
-    return NextResponse.json(
-      { error: parsed.error.flatten().fieldErrors },
-      { status: 400 }
-    );
+    return NextResponse.json({ error: "Invalid project payload." }, { status: 400 });
   }
 
-  const capError = validateCapConsistency(parsed.data.caps);
+  const rawProxyKey = generateOpaqueKey("clv_proxy_");
+  const proxyKeyHash = hashSecret(rawProxyKey);
+  const now = new Date().toISOString();
 
-  if (capError) {
-    return NextResponse.json({ error: capError }, { status: 400 });
-  }
-
-  const created = await createProjectForOwner({
-    ownerEmail: sessionOrResponse.email,
+  const project: Project = {
+    id: randomUUID(),
+    userId: user.id,
     name: parsed.data.name,
-    anthropicApiKey: parsed.data.anthropicApiKey,
-    slackWebhookUrl:
-      parsed.data.slackWebhookUrl && parsed.data.slackWebhookUrl.length > 0
-        ? parsed.data.slackWebhookUrl
-        : null,
-    caps: parsed.data.caps
-  });
+    anthropicApiKeyEncrypted: encryptSecret(parsed.data.anthropicApiKey),
+    proxyKeyHash,
+    proxyKeyPrefix: `${rawProxyKey.slice(0, 14)}...`,
+    createdAt: now,
+    updatedAt: now,
+    slackWebhookUrl: parsed.data.slackWebhookUrl ?? null,
+    caps: normalizeCaps(parsed.data.caps)
+  };
 
-  return NextResponse.json(
-    {
-      project: created.project,
-      proxyKey: created.proxyKey
-    },
-    { status: 201 }
-  );
+  await saveProject(project);
+
+  return NextResponse.json({
+    project: await projectResponse(project),
+    proxyKey: rawProxyKey,
+    proxyEndpoint: `${request.nextUrl.origin}/api/proxy`
+  });
 }
 
 export async function PATCH(request: NextRequest) {
-  const sessionOrResponse = await requirePaidSession(request);
+  const user = await getUserFromRequest(request);
 
-  if (sessionOrResponse instanceof NextResponse) {
-    return sessionOrResponse;
+  if (!user) {
+    return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
+  }
+
+  if (!isUserPaid(user)) {
+    return NextResponse.json({ error: "Active subscription required." }, { status: 402 });
   }
 
   let body: unknown;
@@ -155,67 +169,67 @@ export async function PATCH(request: NextRequest) {
   try {
     body = await request.json();
   } catch {
-    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
   }
 
-  const parsed = patchSchema.safeParse(body);
+  const parsed = updateSchema.safeParse(body);
 
   if (!parsed.success) {
-    return NextResponse.json(
-      { error: parsed.error.flatten().fieldErrors },
-      { status: 400 }
-    );
+    return NextResponse.json({ error: "Invalid update payload." }, { status: 400 });
   }
 
-  const existing = await getProjectForOwner(sessionOrResponse.email, parsed.data.id);
+  const project = await findProjectById(parsed.data.id);
 
-  if (!existing) {
-    return NextResponse.json({ error: "Project not found" }, { status: 404 });
+  if (!project || project.userId !== user.id) {
+    return NextResponse.json({ error: "Project not found." }, { status: 404 });
   }
 
-  const mergedCaps = {
-    dailyCapUsd: parsed.data.caps?.dailyCapUsd ?? existing.dailyCapUsd,
-    weeklyCapUsd: parsed.data.caps?.weeklyCapUsd ?? existing.weeklyCapUsd,
-    monthlyCapUsd: parsed.data.caps?.monthlyCapUsd ?? existing.monthlyCapUsd
+  const next: Project = {
+    ...project,
+    name: parsed.data.name ?? project.name,
+    anthropicApiKeyEncrypted: parsed.data.anthropicApiKey
+      ? encryptSecret(parsed.data.anthropicApiKey)
+      : project.anthropicApiKeyEncrypted,
+    slackWebhookUrl:
+      parsed.data.slackWebhookUrl === undefined ? project.slackWebhookUrl : parsed.data.slackWebhookUrl,
+    caps: parsed.data.caps ? normalizeCaps(parsed.data.caps) : project.caps,
+    updatedAt: new Date().toISOString()
   };
 
-  const capError = validateCapConsistency(mergedCaps);
+  await saveProject(next);
 
-  if (capError) {
-    return NextResponse.json({ error: capError }, { status: 400 });
-  }
-
-  const updated = await updateProjectForOwner({
-    ownerEmail: sessionOrResponse.email,
-    projectId: parsed.data.id,
-    name: parsed.data.name,
-    anthropicApiKey: parsed.data.anthropicApiKey,
-    slackWebhookUrl:
-      parsed.data.slackWebhookUrl !== undefined
-        ? parsed.data.slackWebhookUrl || null
-        : undefined,
-    caps: parsed.data.caps
+  return NextResponse.json({
+    project: await projectResponse(next)
   });
+}
 
-  if (!updated) {
-    return NextResponse.json({ error: "Project not found" }, { status: 404 });
+export async function DELETE(request: NextRequest) {
+  const user = await getUserFromRequest(request);
+
+  if (!user) {
+    return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
   }
 
-  if (parsed.data.rotateProxyKey) {
-    const rotated = await rotateProjectProxyKey({
-      ownerEmail: sessionOrResponse.email,
-      projectId: parsed.data.id
-    });
+  let body: unknown;
 
-    if (!rotated) {
-      return NextResponse.json(
-        { error: "Unable to rotate proxy key" },
-        { status: 500 }
-      );
-    }
-
-    return NextResponse.json({ project: rotated.project, proxyKey: rotated.proxyKey });
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
   }
 
-  return NextResponse.json({ project: updated });
+  const parsed = deleteSchema.safeParse(body);
+
+  if (!parsed.success) {
+    return NextResponse.json({ error: "Invalid delete payload." }, { status: 400 });
+  }
+
+  const project = await findProjectById(parsed.data.id);
+
+  if (!project || project.userId !== user.id) {
+    return NextResponse.json({ error: "Project not found." }, { status: 404 });
+  }
+
+  await deleteProject(project.id);
+  return NextResponse.json({ ok: true });
 }

@@ -1,42 +1,32 @@
 import { NextRequest, NextResponse } from "next/server";
-import {
-  applyLemonWebhook,
-  verifyLemonSqueezySignature
-} from "@/lib/lemonsqueezy";
 
-export const runtime = "nodejs";
+import { applyLemonWebhook, verifyLemonSignature } from "@/lib/lemonsqueezy";
 
 export async function POST(request: NextRequest) {
-  const rawPayload = await request.text();
+  if (!process.env.LEMON_SQUEEZY_WEBHOOK_SECRET) {
+    return NextResponse.json({ error: "Webhook secret not configured." }, { status: 500 });
+  }
+
+  const rawBody = await request.text();
   const signature = request.headers.get("x-signature");
 
-  const valid = verifyLemonSqueezySignature({
-    payload: rawPayload,
-    signature
-  });
-
-  if (!valid) {
-    return NextResponse.json({ error: "Invalid webhook signature" }, { status: 401 });
+  if (!verifyLemonSignature(rawBody, signature)) {
+    return NextResponse.json({ error: "Invalid Lemon Squeezy signature." }, { status: 401 });
   }
 
   let payload: unknown;
 
   try {
-    payload = JSON.parse(rawPayload);
+    payload = JSON.parse(rawBody);
   } catch {
-    return NextResponse.json({ error: "Invalid JSON payload" }, { status: 400 });
+    return NextResponse.json({ error: "Invalid webhook JSON payload." }, { status: 400 });
   }
 
-  const result = await applyLemonWebhook(
-    payload as {
-      meta?: { event_name?: string; custom_data?: Record<string, unknown> };
-      data?: {
-        id?: string;
-        type?: string;
-        attributes?: Record<string, unknown>;
-      };
-    }
-  );
+  const result = await applyLemonWebhook(payload);
 
-  return NextResponse.json({ ok: true, ...result });
+  if (!result.ok) {
+    return NextResponse.json({ error: result.reason || "Webhook processing failed." }, { status: 400 });
+  }
+
+  return NextResponse.json({ ok: true });
 }

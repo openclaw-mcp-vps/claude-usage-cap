@@ -1,176 +1,196 @@
-import { sql, sqlOne } from "@/lib/db";
-import type { ProjectSummary } from "@/lib/projects";
+import { randomUUID } from "node:crypto";
 
-export type UsageEventInput = {
+import { addAlertLog, addUsageEvent, listAlertLogs, listUsageEvents } from "@/lib/storage";
+import type { BillingCaps, Project, UsageEvent } from "@/lib/types";
+
+const MODEL_PRICING_PER_MILLION: Record<
+  string,
+  {
+    input: number;
+    output: number;
+  }
+> = {
+  "claude-3-5-haiku-latest": { input: 0.8, output: 4 },
+  "claude-3-5-sonnet-latest": { input: 3, output: 15 },
+  "claude-3-7-sonnet-latest": { input: 3, output: 15 },
+  "claude-sonnet-4-0": { input: 3, output: 15 },
+  "claude-opus-4-0": { input: 15, output: 75 }
+};
+
+const DEFAULT_PRICING = { input: 3, output: 15 };
+
+export function normalizeModelName(model: string): string {
+  return model.trim().toLowerCase();
+}
+
+export function calculateCostUsd(model: string, inputTokens: number, outputTokens: number): number {
+  const pricing = MODEL_PRICING_PER_MILLION[normalizeModelName(model)] ?? DEFAULT_PRICING;
+  const inputCost = (Math.max(0, inputTokens) / 1_000_000) * pricing.input;
+  const outputCost = (Math.max(0, outputTokens) / 1_000_000) * pricing.output;
+
+  return Number((inputCost + outputCost).toFixed(6));
+}
+
+export function periodStart(period: "daily" | "weekly" | "monthly", date = new Date()): Date {
+  const value = new Date(date);
+
+  if (period === "daily") {
+    value.setUTCHours(0, 0, 0, 0);
+    return value;
+  }
+
+  if (period === "weekly") {
+    const day = value.getUTCDay();
+    const diff = (day + 6) % 7;
+    value.setUTCDate(value.getUTCDate() - diff);
+    value.setUTCHours(0, 0, 0, 0);
+    return value;
+  }
+
+  value.setUTCDate(1);
+  value.setUTCHours(0, 0, 0, 0);
+  return value;
+}
+
+export async function recordUsage(params: {
   projectId: string;
+  requestId: string;
   model: string;
   inputTokens: number;
   outputTokens: number;
-  cacheCreationTokens: number;
-  cacheReadTokens: number;
   costUsd: number;
-};
-
-export type UsageTotals = {
-  day: number;
-  week: number;
-  month: number;
-};
-
-export type UsagePoint = {
-  day: string;
-  costUsd: number;
-};
-
-export type WindowType = "day" | "week" | "month";
-
-function toUtcDayStart(date: Date): Date {
-  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
-}
-
-function toUtcMonthStart(date: Date): Date {
-  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1));
-}
-
-function toUtcWeekStart(date: Date): Date {
-  const dayStart = toUtcDayStart(date);
-  const day = dayStart.getUTCDay();
-  const daysFromMonday = (day + 6) % 7;
-  dayStart.setUTCDate(dayStart.getUTCDate() - daysFromMonday);
-  return dayStart;
-}
-
-export function getUsageWindows(now = new Date()): {
-  dayStart: Date;
-  weekStart: Date;
-  monthStart: Date;
-} {
-  return {
-    dayStart: toUtcDayStart(now),
-    weekStart: toUtcWeekStart(now),
-    monthStart: toUtcMonthStart(now)
+}): Promise<UsageEvent> {
+  const event: UsageEvent = {
+    id: randomUUID(),
+    projectId: params.projectId,
+    requestId: params.requestId,
+    model: params.model,
+    inputTokens: params.inputTokens,
+    outputTokens: params.outputTokens,
+    costUsd: params.costUsd,
+    createdAt: new Date().toISOString()
   };
+
+  await addUsageEvent(event);
+  return event;
 }
 
-export async function recordUsageEvent(input: UsageEventInput): Promise<void> {
-  await sql(
-    `
-    INSERT INTO usage_events (
-      project_id,
-      model,
-      input_tokens,
-      output_tokens,
-      cache_creation_tokens,
-      cache_read_tokens,
-      cost_usd
-    )
-    VALUES ($1,$2,$3,$4,$5,$6,$7)
-    `,
-    [
-      input.projectId,
-      input.model,
-      input.inputTokens,
-      input.outputTokens,
-      input.cacheCreationTokens,
-      input.cacheReadTokens,
-      input.costUsd
-    ]
+export async function usageTotals(projectId: string): Promise<{
+  daily: number;
+  weekly: number;
+  monthly: number;
+}> {
+  const events = await listUsageEvents(projectId);
+  const dailyStart = periodStart("daily").getTime();
+  const weeklyStart = periodStart("weekly").getTime();
+  const monthlyStart = periodStart("monthly").getTime();
+
+  return events.reduce(
+    (totals, event) => {
+      const ts = new Date(event.createdAt).getTime();
+
+      if (ts >= dailyStart) {
+        totals.daily += event.costUsd;
+      }
+
+      if (ts >= weeklyStart) {
+        totals.weekly += event.costUsd;
+      }
+
+      if (ts >= monthlyStart) {
+        totals.monthly += event.costUsd;
+      }
+
+      return totals;
+    },
+    {
+      daily: 0,
+      weekly: 0,
+      monthly: 0
+    }
   );
 }
 
-export async function getUsageTotals(projectId: string, now = new Date()): Promise<UsageTotals> {
-  const { dayStart, weekStart, monthStart } = getUsageWindows(now);
+export async function usageSeries(projectId: string, days = 30): Promise<Array<{ date: string; costUsd: number }>> {
+  const events = await listUsageEvents(projectId);
+  const now = new Date();
+  const buckets = new Map<string, number>();
 
-  const [dayRow, weekRow, monthRow] = await Promise.all([
-    sqlOne<{ total: string }>(
-      `SELECT COALESCE(SUM(cost_usd), 0) AS total FROM usage_events WHERE project_id = $1 AND created_at >= $2`,
-      [projectId, dayStart.toISOString()]
-    ),
-    sqlOne<{ total: string }>(
-      `SELECT COALESCE(SUM(cost_usd), 0) AS total FROM usage_events WHERE project_id = $1 AND created_at >= $2`,
-      [projectId, weekStart.toISOString()]
-    ),
-    sqlOne<{ total: string }>(
-      `SELECT COALESCE(SUM(cost_usd), 0) AS total FROM usage_events WHERE project_id = $1 AND created_at >= $2`,
-      [projectId, monthStart.toISOString()]
-    )
-  ]);
+  for (let i = days - 1; i >= 0; i -= 1) {
+    const date = new Date(now);
+    date.setUTCDate(now.getUTCDate() - i);
+    const key = date.toISOString().slice(0, 10);
+    buckets.set(key, 0);
+  }
 
-  return {
-    day: Number(dayRow?.total ?? 0),
-    week: Number(weekRow?.total ?? 0),
-    month: Number(monthRow?.total ?? 0)
-  };
-}
+  events.forEach((event) => {
+    const key = event.createdAt.slice(0, 10);
 
-export async function getDailyUsageSeries(
-  projectId: string,
-  days = 30,
-  now = new Date()
-): Promise<UsagePoint[]> {
-  const cappedDays = Math.max(1, Math.min(days, 120));
-  const dayStart = toUtcDayStart(now);
-  const rangeStart = new Date(dayStart);
-  rangeStart.setUTCDate(rangeStart.getUTCDate() - (cappedDays - 1));
-
-  const rows = await sql<{ day: string; total: string }>(
-    `
-    SELECT
-      DATE_TRUNC('day', created_at)::date::text AS day,
-      COALESCE(SUM(cost_usd), 0) AS total
-    FROM usage_events
-    WHERE project_id = $1 AND created_at >= $2
-    GROUP BY DATE_TRUNC('day', created_at)
-    ORDER BY DATE_TRUNC('day', created_at)
-    `,
-    [projectId, rangeStart.toISOString()]
-  );
-
-  const lookup = new Map<string, number>();
-  rows.forEach((row) => {
-    lookup.set(row.day, Number(row.total));
+    if (buckets.has(key)) {
+      buckets.set(key, Number(((buckets.get(key) ?? 0) + event.costUsd).toFixed(6)));
+    }
   });
 
-  const points: UsagePoint[] = [];
-
-  for (let i = 0; i < cappedDays; i += 1) {
-    const pointDate = new Date(rangeStart);
-    pointDate.setUTCDate(rangeStart.getUTCDate() + i);
-    const key = pointDate.toISOString().slice(0, 10);
-
-    points.push({
-      day: key,
-      costUsd: lookup.get(key) ?? 0
-    });
-  }
-
-  return points;
+  return [...buckets.entries()].map(([date, costUsd]) => ({ date, costUsd }));
 }
 
-export function evaluateCapStatus(project: ProjectSummary, totals: UsageTotals): {
-  exceeded: Array<{ window: WindowType; total: number; cap: number }>;
-  remaining: { day: number; week: number; month: number };
-} {
-  const exceeded: Array<{ window: WindowType; total: number; cap: number }> = [];
+export async function limitStatus(project: Project): Promise<{
+  exceeded: null | "daily" | "weekly" | "monthly";
+  totals: { daily: number; weekly: number; monthly: number };
+  caps: BillingCaps;
+}> {
+  const totals = await usageTotals(project.id);
 
-  if (totals.day >= project.dailyCapUsd) {
-    exceeded.push({ window: "day", total: totals.day, cap: project.dailyCapUsd });
+  if (totals.daily >= project.caps.dailyUsd) {
+    return {
+      exceeded: "daily",
+      totals,
+      caps: project.caps
+    };
   }
 
-  if (totals.week >= project.weeklyCapUsd) {
-    exceeded.push({ window: "week", total: totals.week, cap: project.weeklyCapUsd });
+  if (totals.weekly >= project.caps.weeklyUsd) {
+    return {
+      exceeded: "weekly",
+      totals,
+      caps: project.caps
+    };
   }
 
-  if (totals.month >= project.monthlyCapUsd) {
-    exceeded.push({ window: "month", total: totals.month, cap: project.monthlyCapUsd });
+  if (totals.monthly >= project.caps.monthlyUsd) {
+    return {
+      exceeded: "monthly",
+      totals,
+      caps: project.caps
+    };
   }
 
   return {
-    exceeded,
-    remaining: {
-      day: Math.max(0, project.dailyCapUsd - totals.day),
-      week: Math.max(0, project.weeklyCapUsd - totals.week),
-      month: Math.max(0, project.monthlyCapUsd - totals.month)
-    }
+    exceeded: null,
+    totals,
+    caps: project.caps
   };
+}
+
+export async function shouldSendLimitAlert(projectId: string, period: "daily" | "weekly" | "monthly"): Promise<boolean> {
+  const logs = await listAlertLogs(projectId);
+  const start = periodStart(period).toISOString();
+
+  const hasLog = logs.some((item) => item.period === period && item.periodStart === start);
+  return !hasLog;
+}
+
+export async function markLimitAlertSent(params: {
+  projectId: string;
+  period: "daily" | "weekly" | "monthly";
+  message: string;
+}): Promise<void> {
+  await addAlertLog({
+    id: randomUUID(),
+    projectId: params.projectId,
+    period: params.period,
+    periodStart: periodStart(params.period).toISOString(),
+    createdAt: new Date().toISOString(),
+    message: params.message
+  });
 }

@@ -1,117 +1,95 @@
-import crypto from "crypto";
+import { randomUUID } from "node:crypto";
+
+import { SignJWT, jwtVerify } from "jose";
 import { cookies } from "next/headers";
 import { NextRequest, NextResponse } from "next/server";
 
-const SESSION_COOKIE = "claw_session";
-const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30;
+import { findUserByEmail, findUserById, upsertUser } from "@/lib/storage";
+import type { SessionClaims, User } from "@/lib/types";
 
-function getCookieSecret(): string {
-  return process.env.APP_COOKIE_SECRET ?? "local-dev-cookie-secret-change-me";
+export const SESSION_COOKIE = "clv_session";
+
+const THIRTY_DAYS = 60 * 60 * 24 * 30;
+
+function authSecret(): Uint8Array {
+  const secret = process.env.AUTH_SECRET || "dev-auth-secret-change-me";
+  return new TextEncoder().encode(secret);
 }
 
-function base64url(input: string): string {
-  return Buffer.from(input, "utf8").toString("base64url");
-}
-
-function sign(payloadB64: string): string {
-  return crypto
-    .createHmac("sha256", getCookieSecret())
-    .update(payloadB64)
-    .digest("base64url");
-}
-
-function createToken(email: string): string {
-  const now = Math.floor(Date.now() / 1000);
-  const payload = {
-    email,
-    exp: now + SESSION_TTL_SECONDS
-  };
-
-  const payloadB64 = base64url(JSON.stringify(payload));
-  const signature = sign(payloadB64);
-  return `${payloadB64}.${signature}`;
-}
-
-function verifyToken(token: string): { email: string; exp: number } | null {
-  const [payloadB64, signature] = token.split(".");
-
-  if (!payloadB64 || !signature) {
-    return null;
+export function isUserPaid(user: User): boolean {
+  if (!user.paidUntil) {
+    return false;
   }
 
-  const expected = sign(payloadB64);
-  const providedBuffer = Buffer.from(signature);
-  const expectedBuffer = Buffer.from(expected);
+  return new Date(user.paidUntil).getTime() > Date.now() && user.subscriptionStatus === "active";
+}
 
-  if (providedBuffer.length !== expectedBuffer.length) {
-    return null;
-  }
+export async function signSession(claims: SessionClaims): Promise<string> {
+  return new SignJWT(claims)
+    .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+    .setIssuedAt()
+    .setExpirationTime(`${THIRTY_DAYS}s`)
+    .sign(authSecret());
+}
 
-  if (!crypto.timingSafeEqual(providedBuffer, expectedBuffer)) {
-    return null;
-  }
-
-  const payloadText = Buffer.from(payloadB64, "base64url").toString("utf8");
-
+export async function verifySession(token: string): Promise<SessionClaims | null> {
   try {
-    const payload = JSON.parse(payloadText) as { email: string; exp: number };
-    const now = Math.floor(Date.now() / 1000);
+    const { payload } = await jwtVerify(token, authSecret());
 
-    if (!payload.email || payload.exp < now) {
+    if (typeof payload.sub !== "string" || typeof payload.email !== "string") {
       return null;
     }
 
-    return payload;
+    return {
+      sub: payload.sub,
+      email: payload.email
+    };
   } catch {
     return null;
   }
 }
 
-export function setSessionCookie(response: NextResponse, email: string): void {
-  const token = createToken(email);
+export async function getOrCreateUser(email: string): Promise<User> {
+  const normalized = email.trim().toLowerCase();
+  const now = new Date().toISOString();
+  const existing = await findUserByEmail(normalized);
 
-  response.cookies.set({
-    name: SESSION_COOKIE,
-    value: token,
-    httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: "lax",
-    path: "/",
-    maxAge: SESSION_TTL_SECONDS
-  });
+  if (existing) {
+    return existing;
+  }
+
+  const user: User = {
+    id: randomUUID(),
+    email: normalized,
+    createdAt: now,
+    updatedAt: now,
+    paidUntil: null,
+    subscriptionStatus: "inactive",
+    lemonCustomerId: null,
+    lemonSubscriptionId: null
+  };
+
+  await upsertUser(user);
+  return user;
 }
 
-export function clearSessionCookie(response: NextResponse): void {
-  response.cookies.set({
-    name: SESSION_COOKIE,
-    value: "",
-    httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: "lax",
-    path: "/",
-    maxAge: 0
-  });
-}
-
-export function getSessionFromRequest(
-  request: NextRequest
-): { email: string } | null {
+export async function getUserFromRequest(request: NextRequest): Promise<User | null> {
   const token = request.cookies.get(SESSION_COOKIE)?.value;
 
   if (!token) {
     return null;
   }
 
-  const payload = verifyToken(token);
+  const claims = await verifySession(token);
 
-  if (!payload) {
+  if (!claims?.sub) {
     return null;
   }
 
-  return { email: payload.email };
+  return findUserById(claims.sub);
 }
 
-export async function getSessionFromServerCookies(): Promise<{ email: string } | null> {
+export async function getUserFromServerCookies(): Promise<User | null> {
   const cookieStore = await cookies();
   const token = cookieStore.get(SESSION_COOKIE)?.value;
 
@@ -119,11 +97,40 @@ export async function getSessionFromServerCookies(): Promise<{ email: string } |
     return null;
   }
 
-  const payload = verifyToken(token);
+  const claims = await verifySession(token);
 
-  if (!payload) {
+  if (!claims?.sub) {
     return null;
   }
 
-  return { email: payload.email };
+  return findUserById(claims.sub);
+}
+
+export async function attachSession(response: NextResponse, user: User): Promise<void> {
+  const token = await signSession({
+    sub: user.id,
+    email: user.email
+  });
+
+  response.cookies.set({
+    name: SESSION_COOKIE,
+    value: token,
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+    maxAge: THIRTY_DAYS,
+    path: "/"
+  });
+}
+
+export function clearSession(response: NextResponse): void {
+  response.cookies.set({
+    name: SESSION_COOKIE,
+    value: "",
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+    maxAge: 0,
+    path: "/"
+  });
 }

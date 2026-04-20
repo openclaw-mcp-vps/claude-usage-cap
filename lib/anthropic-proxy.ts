@@ -1,117 +1,119 @@
-import Anthropic from "@anthropic-ai/sdk";
+import { randomUUID } from "node:crypto";
 
-type Pricing = {
-  inputPerMillion: number;
-  outputPerMillion: number;
-  cacheWritePerMillion?: number;
-  cacheReadPerMillion?: number;
-};
+import { decryptSecret } from "@/lib/security";
+import { calculateCostUsd } from "@/lib/usage-tracker";
+import type { Project } from "@/lib/types";
 
-const MODEL_PRICING: Record<string, Pricing> = {
-  "claude-sonnet-4-20250514": {
-    inputPerMillion: 3,
-    outputPerMillion: 15,
-    cacheWritePerMillion: 3.75,
-    cacheReadPerMillion: 0.3
-  },
-  "claude-opus-4-20250514": {
-    inputPerMillion: 15,
-    outputPerMillion: 75,
-    cacheWritePerMillion: 18.75,
-    cacheReadPerMillion: 1.5
-  },
-  "claude-3-5-sonnet-20241022": {
-    inputPerMillion: 3,
-    outputPerMillion: 15,
-    cacheWritePerMillion: 3.75,
-    cacheReadPerMillion: 0.3
-  },
-  "claude-3-5-haiku-20241022": {
-    inputPerMillion: 0.8,
-    outputPerMillion: 4,
-    cacheWritePerMillion: 1,
-    cacheReadPerMillion: 0.08
-  },
-  "claude-3-opus-20240229": {
-    inputPerMillion: 15,
-    outputPerMillion: 75,
-    cacheWritePerMillion: 18.75,
-    cacheReadPerMillion: 1.5
-  }
-};
-
-const FALLBACK_PRICING: Pricing = {
-  inputPerMillion: 3,
-  outputPerMillion: 15,
-  cacheWritePerMillion: 3.75,
-  cacheReadPerMillion: 0.3
-};
-
-type UsageShape = {
+type AnthropicUsage = {
   input_tokens?: number;
   output_tokens?: number;
-  cache_creation_input_tokens?: number;
-  cache_read_input_tokens?: number;
-  cache_creation_tokens?: number;
-  cache_read_tokens?: number;
 };
 
-function pickPricing(model: string): Pricing {
-  const exact = MODEL_PRICING[model];
+type AnthropicResponseBody = {
+  id?: string;
+  model?: string;
+  usage?: AnthropicUsage;
+  error?: {
+    message?: string;
+  };
+};
 
-  if (exact) {
-    return exact;
-  }
+export async function proxyAnthropicRequest(params: {
+  project: Project;
+  requestBody: unknown;
+  requestHeaders: Headers;
+}): Promise<{
+  status: number;
+  body: AnthropicResponseBody | string;
+  usage: {
+    requestId: string;
+    model: string;
+    inputTokens: number;
+    outputTokens: number;
+    costUsd: number;
+  } | null;
+}> {
+  const apiKey = decryptSecret(params.project.anthropicApiKeyEncrypted);
+  const body = params.requestBody;
 
-  const normalized = model.toLowerCase();
-
-  if (normalized.includes("opus")) {
+  if (!body || typeof body !== "object") {
     return {
-      inputPerMillion: 15,
-      outputPerMillion: 75,
-      cacheWritePerMillion: 18.75,
-      cacheReadPerMillion: 1.5
+      status: 400,
+      body: {
+        error: {
+          message: "Request JSON body is required"
+        }
+      },
+      usage: null
     };
   }
 
-  if (normalized.includes("haiku")) {
+  const typed = body as { stream?: boolean };
+
+  if (typed.stream === true) {
     return {
-      inputPerMillion: 0.8,
-      outputPerMillion: 4,
-      cacheWritePerMillion: 1,
-      cacheReadPerMillion: 0.08
+      status: 400,
+      body: {
+        error: {
+          message: "Streaming is not supported by this proxy. Set stream=false."
+        }
+      },
+      usage: null
     };
   }
 
-  return FALLBACK_PRICING;
-}
+  const version = params.requestHeaders.get("anthropic-version") || "2023-06-01";
+  const betaHeader = params.requestHeaders.get("anthropic-beta");
 
-export function estimateClaudeCostUsd(model: string, usage: UsageShape): number {
-  const pricing = pickPricing(model);
+  const headers: HeadersInit = {
+    "content-type": "application/json",
+    "x-api-key": apiKey,
+    "anthropic-version": version
+  };
 
-  const input = usage.input_tokens ?? 0;
-  const output = usage.output_tokens ?? 0;
-  const cacheWrite =
-    usage.cache_creation_input_tokens ?? usage.cache_creation_tokens ?? 0;
-  const cacheRead = usage.cache_read_input_tokens ?? usage.cache_read_tokens ?? 0;
+  if (betaHeader) {
+    headers["anthropic-beta"] = betaHeader;
+  }
 
-  const total =
-    (input / 1_000_000) * pricing.inputPerMillion +
-    (output / 1_000_000) * pricing.outputPerMillion +
-    (cacheWrite / 1_000_000) * (pricing.cacheWritePerMillion ?? 0) +
-    (cacheRead / 1_000_000) * (pricing.cacheReadPerMillion ?? 0);
-
-  return Number(total.toFixed(6));
-}
-
-export async function sendClaudeRequest(input: {
-  anthropicApiKey: string;
-  payload: Record<string, unknown>;
-}): Promise<Record<string, unknown>> {
-  const client = new Anthropic({
-    apiKey: input.anthropicApiKey
+  const upstreamResponse = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body)
   });
 
-  const response = await client.messages.create(input.payload as never);
-  return response as unknown as Record<string, unknown>;
+  const responseText = await upstreamResponse.text();
+  let parsed: AnthropicResponseBody | string = responseText;
+
+  try {
+    parsed = JSON.parse(responseText) as AnthropicResponseBody;
+  } catch {
+    parsed = responseText;
+  }
+
+  if (!upstreamResponse.ok || typeof parsed === "string") {
+    return {
+      status: upstreamResponse.status,
+      body: parsed,
+      usage: null
+    };
+  }
+
+  const model = parsed.model || "unknown-model";
+  const usage = parsed.usage || {};
+  const inputTokens = Math.max(0, usage.input_tokens ?? 0);
+  const outputTokens = Math.max(0, usage.output_tokens ?? 0);
+  const requestId = parsed.id || randomUUID();
+  const costUsd = calculateCostUsd(model, inputTokens, outputTokens);
+
+  return {
+    status: upstreamResponse.status,
+    body: parsed,
+    usage: {
+      requestId,
+      model,
+      inputTokens,
+      outputTokens,
+      costUsd
+    }
+  };
 }

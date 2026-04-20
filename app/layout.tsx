@@ -1,68 +1,37 @@
 import type { Metadata } from "next";
-import { JetBrains_Mono, Space_Grotesk } from "next/font/google";
-import "./globals.css";
+import Script from "next/script";
 
-const spaceGrotesk = Space_Grotesk({
-  subsets: ["latin"],
-  variable: "--font-space-grotesk"
-});
-
-const jetBrainsMono = JetBrains_Mono({
-  subsets: ["latin"],
-  variable: "--font-jetbrains-mono"
-});
+import "@/app/globals.css";
 
 export const metadata: Metadata = {
-  metadataBase: new URL("https://claude-usage-cap.com"),
+  metadataBase: new URL(process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000"),
   title: {
     default: "Claude Usage Cap",
     template: "%s | Claude Usage Cap"
   },
   description:
-    "Set daily, weekly, and monthly spend caps on Claude API usage per project. Auto-cut off runaway jobs and send Slack alerts the moment limits are hit.",
-  keywords: [
-    "Claude API budget cap",
-    "Anthropic proxy",
-    "AI cost control",
-    "SaaS founder tools",
-    "runaway spend prevention"
-  ],
+    "Set per-project spend limits for Anthropic Claude API usage. Get a proxy key with daily, weekly, and monthly caps plus instant Slack alerts when limits are hit.",
   openGraph: {
     title: "Claude Usage Cap",
     description:
-      "Per-project spend limits on the Claude API with automatic 429 cut-off and Slack alerts.",
-    url: "https://claude-usage-cap.com",
+      "Per-project spend limits on the Claude API with auto-cutoff and Slack alerts to stop runaway costs.",
+    url: "/",
     siteName: "Claude Usage Cap",
-    type: "website",
-    images: [
-      {
-        url: "/opengraph-image",
-        width: 1200,
-        height: 630,
-        alt: "Claude Usage Cap"
-      }
-    ]
+    type: "website"
   },
   twitter: {
     card: "summary_large_image",
     title: "Claude Usage Cap",
     description:
-      "Per-project spend limits on Claude API usage. Auto-cutoff at cap + Slack alert.",
-    images: ["/opengraph-image"]
+      "Stop runaway Anthropic spend. Enforce hard daily, weekly, and monthly caps on every project."
   }
 };
 
-export default function RootLayout({
-  children
-}: Readonly<{
-  children: React.ReactNode;
-}>) {
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en" className="dark">
-      <body
-        className={`${spaceGrotesk.variable} ${jetBrainsMono.variable} bg-[#0d1117] text-[#e6edf3] antialiased`}
-        style={{ fontFamily: "var(--font-space-grotesk), sans-serif" }}
-      >
+      <body className="min-h-screen bg-[#0d1117] text-[#e6edf3] antialiased">
+        <Script src="https://app.lemonsqueezy.com/js/lemon.js" strategy="afterInteractive" />
         {children}
       </body>
     </html>

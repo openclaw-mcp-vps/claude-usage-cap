@@ -1,247 +1,147 @@
-import crypto from "crypto";
-import { sql, sqlOne } from "@/lib/db";
+import { createHmac, randomUUID } from "node:crypto";
 
-export type SubscriptionRecord = {
-  email: string;
-  status: string;
-  customerId: string | null;
-  subscriptionId: string | null;
-  orderId: string | null;
-  currentPeriodEnd: string | null;
-  updatedAt: string;
-};
+import { addCheckoutSession, findUserById, upsertUser } from "@/lib/storage";
+import type { User } from "@/lib/types";
 
-type LemonWebhookPayload = {
-  meta?: {
-    event_name?: string;
-    custom_data?: Record<string, unknown>;
-  };
-  data?: {
-    id?: string;
-    type?: string;
-    attributes?: {
-      status?: string;
-      user_email?: string;
-      customer_email?: string;
-      customer_id?: number | string;
-      order_id?: number | string;
-      subscription_id?: number | string;
-      renews_at?: string;
-      ends_at?: string;
-      cancelled?: boolean;
-    };
-  };
-};
-
-function mapSubscriptionRow(row: {
-  email: string;
-  status: string;
-  customer_id: string | null;
-  subscription_id: string | null;
-  order_id: string | null;
-  current_period_end: string | null;
-  updated_at: string;
-}): SubscriptionRecord {
-  return {
-    email: row.email,
-    status: row.status,
-    customerId: row.customer_id,
-    subscriptionId: row.subscription_id,
-    orderId: row.order_id,
-    currentPeriodEnd: row.current_period_end,
-    updatedAt: row.updated_at
-  };
+function webhookSecret(): string {
+  return process.env.LEMON_SQUEEZY_WEBHOOK_SECRET || "";
 }
 
-export function verifyLemonSqueezySignature(input: {
-  payload: string;
-  signature: string | null;
-}): boolean {
-  const secret = process.env.LEMON_SQUEEZY_WEBHOOK_SECRET;
+export function buildCheckoutUrl(options: { userId: string; email: string }): string | null {
+  const storeId = process.env.NEXT_PUBLIC_LEMON_SQUEEZY_STORE_ID;
+  const productId = process.env.NEXT_PUBLIC_LEMON_SQUEEZY_PRODUCT_ID;
 
-  if (!secret || !input.signature) {
-    return false;
-  }
-
-  const digest = crypto.createHmac("sha256", secret).update(input.payload).digest("hex");
-
-  const digestBuffer = Buffer.from(digest, "utf8");
-  const signatureBuffer = Buffer.from(input.signature, "utf8");
-
-  if (digestBuffer.length !== signatureBuffer.length) {
-    return false;
-  }
-
-  return crypto.timingSafeEqual(digestBuffer, signatureBuffer);
-}
-
-export function isSubscriptionActiveStatus(status: string | null | undefined): boolean {
-  if (!status) {
-    return false;
-  }
-
-  const normalized = status.toLowerCase();
-
-  return ["active", "on_trial", "trialing", "paid", "past_due"].includes(normalized);
-}
-
-export function buildLemonCheckoutUrl(email?: string): string {
-  const storeId = process.env.NEXT_PUBLIC_LEMON_SQUEEZY_STORE_ID ?? "";
-  const productId = process.env.NEXT_PUBLIC_LEMON_SQUEEZY_PRODUCT_ID ?? "";
-
-  if (!productId) {
-    return "https://www.lemonsqueezy.com";
+  if (!storeId || !productId) {
+    return null;
   }
 
   const url = new URL(`https://app.lemonsqueezy.com/checkout/buy/${productId}`);
-  url.searchParams.set("embed", "1");
-  url.searchParams.set("media", "0");
-  url.searchParams.set("logo", "0");
-  if (storeId) {
-    url.searchParams.set("store", storeId);
-  }
+  url.searchParams.set("checkout[email]", options.email);
+  url.searchParams.set("checkout[custom][user_id]", options.userId);
+  url.searchParams.set("checkout[custom][store_id]", storeId);
 
-  if (email) {
-    url.searchParams.set("checkout[email]", email);
+  const baseUrl = process.env.NEXT_PUBLIC_APP_URL;
+  if (baseUrl) {
+    url.searchParams.set("checkout[success_url]", `${baseUrl}/dashboard?checkout=success`);
   }
 
   return url.toString();
 }
 
-export async function getSubscriptionByEmail(
-  email: string
-): Promise<SubscriptionRecord | null> {
-  const row = await sqlOne<{
-    email: string;
-    status: string;
-    customer_id: string | null;
-    subscription_id: string | null;
-    order_id: string | null;
-    current_period_end: string | null;
-    updated_at: string;
-  }>(
-    `
-    SELECT
-      email,
-      status,
-      customer_id,
-      subscription_id,
-      order_id,
-      current_period_end,
-      updated_at
-    FROM subscriptions
-    WHERE email = $1
-    LIMIT 1
-    `,
-    [email.toLowerCase()]
-  );
+export function verifyLemonSignature(rawBody: string, signature: string | null): boolean {
+  const secret = webhookSecret();
 
-  if (!row) {
-    return null;
-  }
-
-  return mapSubscriptionRow(row);
-}
-
-export async function hasActiveSubscription(email: string): Promise<boolean> {
-  const record = await getSubscriptionByEmail(email);
-
-  if (!record) {
+  if (!secret || !signature) {
     return false;
   }
 
-  return isSubscriptionActiveStatus(record.status);
+  const digest = createHmac("sha256", secret).update(rawBody).digest("hex");
+  return digest === signature;
 }
 
-async function wasWebhookProcessed(eventKey: string): Promise<boolean> {
-  const row = await sqlOne<{ event_key: string }>(
-    `SELECT event_key FROM processed_webhooks WHERE event_key = $1 LIMIT 1`,
-    [eventKey]
-  );
-
-  return Boolean(row);
+function plusDays(days: number): string {
+  const date = new Date();
+  date.setDate(date.getDate() + days);
+  return date.toISOString();
 }
 
-async function markWebhookProcessed(eventKey: string): Promise<void> {
-  await sql(
-    `
-    INSERT INTO processed_webhooks (event_key)
-    VALUES ($1)
-    ON CONFLICT (event_key) DO NOTHING
-    `,
-    [eventKey]
-  );
+async function markUserPaid(user: User, attributes: Record<string, unknown>): Promise<User> {
+  const now = new Date().toISOString();
+
+  const next: User = {
+    ...user,
+    updatedAt: now,
+    paidUntil: plusDays(31),
+    subscriptionStatus: "active",
+    lemonCustomerId:
+      typeof attributes.customer_id === "number" || typeof attributes.customer_id === "string"
+        ? String(attributes.customer_id)
+        : user.lemonCustomerId,
+    lemonSubscriptionId:
+      typeof attributes.subscription_id === "number" || typeof attributes.subscription_id === "string"
+        ? String(attributes.subscription_id)
+        : user.lemonSubscriptionId
+  };
+
+  await upsertUser(next);
+
+  await addCheckoutSession({
+    id: randomUUID(),
+    userId: user.id,
+    createdAt: now,
+    source: "lemonsqueezy",
+    paid: true
+  });
+
+  return next;
 }
 
-export async function applyLemonWebhook(
-  payload: LemonWebhookPayload
-): Promise<{ ignored: boolean; reason?: string }> {
-  const eventName = payload.meta?.event_name ?? "unknown";
-  const dataId = payload.data?.id ?? "no-id";
-  const eventKey = `${eventName}:${dataId}`;
+async function markUserInactive(user: User): Promise<User> {
+  const next: User = {
+    ...user,
+    updatedAt: new Date().toISOString(),
+    paidUntil: user.paidUntil,
+    subscriptionStatus: "inactive"
+  };
 
-  if (await wasWebhookProcessed(eventKey)) {
-    return { ignored: true, reason: "Webhook already processed" };
+  await upsertUser(next);
+  return next;
+}
+
+export async function applyLemonWebhook(payload: unknown): Promise<{ ok: boolean; reason?: string }> {
+  if (!payload || typeof payload !== "object") {
+    return { ok: false, reason: "invalid payload" };
   }
 
-  const attrs = payload.data?.attributes ?? {};
-  const emailCandidate =
-    (attrs.user_email as string | undefined) ??
-    (attrs.customer_email as string | undefined) ??
-    (payload.meta?.custom_data?.email as string | undefined);
+  const typed = payload as {
+    meta?: { event_name?: string; custom_data?: Record<string, unknown> };
+    data?: { attributes?: Record<string, unknown> };
+  };
 
-  if (!emailCandidate) {
-    await markWebhookProcessed(eventKey);
-    return { ignored: true, reason: "No customer email found in webhook" };
+  const eventName = typed.meta?.event_name;
+  const attributes = typed.data?.attributes ?? {};
+  const customData = typed.meta?.custom_data ?? {};
+
+  const userIdRaw = customData.user_id;
+  const userId = typeof userIdRaw === "string" ? userIdRaw : null;
+
+  if (!userId) {
+    return { ok: false, reason: "missing custom user_id" };
   }
 
-  const email = emailCandidate.toLowerCase();
-  const incomingStatus = (attrs.status as string | undefined) ?? "inactive";
+  const user = await findUserById(userId);
 
-  let status = incomingStatus;
-
-  if (eventName.includes("cancel") || attrs.cancelled) {
-    status = "cancelled";
+  if (!user) {
+    return { ok: false, reason: "user not found" };
   }
 
-  if (eventName === "order_created" && !attrs.status) {
-    status = "active";
+  if (
+    eventName === "order_created" ||
+    eventName === "order_refunded" ||
+    eventName === "subscription_created" ||
+    eventName === "subscription_resumed" ||
+    eventName === "subscription_updated"
+  ) {
+    const status = attributes.status;
+
+    if (typeof status === "string" && ["paid", "active", "on_trial"].includes(status)) {
+      await markUserPaid(user, attributes);
+      return { ok: true };
+    }
+
+    if (typeof status === "string" && ["cancelled", "expired", "past_due", "unpaid"].includes(status)) {
+      await markUserInactive(user);
+      return { ok: true };
+    }
+
+    await markUserPaid(user, attributes);
+    return { ok: true };
   }
 
-  const currentPeriodEnd =
-    (attrs.renews_at as string | undefined) ?? (attrs.ends_at as string | undefined) ?? null;
+  if (eventName === "subscription_cancelled" || eventName === "subscription_expired") {
+    await markUserInactive(user);
+    return { ok: true };
+  }
 
-  await sql(
-    `
-    INSERT INTO subscriptions (
-      email,
-      status,
-      customer_id,
-      subscription_id,
-      order_id,
-      current_period_end,
-      updated_at
-    )
-    VALUES ($1,$2,$3,$4,$5,$6,NOW())
-    ON CONFLICT (email)
-    DO UPDATE SET
-      status = EXCLUDED.status,
-      customer_id = COALESCE(EXCLUDED.customer_id, subscriptions.customer_id),
-      subscription_id = COALESCE(EXCLUDED.subscription_id, subscriptions.subscription_id),
-      order_id = COALESCE(EXCLUDED.order_id, subscriptions.order_id),
-      current_period_end = COALESCE(EXCLUDED.current_period_end, subscriptions.current_period_end),
-      updated_at = NOW()
-    `,
-    [
-      email,
-      status,
-      attrs.customer_id ? String(attrs.customer_id) : null,
-      attrs.subscription_id ? String(attrs.subscription_id) : payload.data?.id ?? null,
-      attrs.order_id ? String(attrs.order_id) : null,
-      currentPeriodEnd
-    ]
-  );
-
-  await markWebhookProcessed(eventKey);
-  return { ignored: false };
+  return { ok: true };
 }

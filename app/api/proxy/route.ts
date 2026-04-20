@@ -1,88 +1,105 @@
 import { NextRequest, NextResponse } from "next/server";
-import { z } from "zod";
-import {
-  estimateClaudeCostUsd,
-  sendClaudeRequest
-} from "@/lib/anthropic-proxy";
-import { hasActiveSubscription } from "@/lib/lemonsqueezy";
-import { getProjectForProxyKey } from "@/lib/projects";
-import { sendCapExceededAlert } from "@/lib/slack-alerts";
-import {
-  evaluateCapStatus,
-  getUsageTotals,
-  recordUsageEvent,
-  type WindowType
-} from "@/lib/usage-tracker";
 
-export const runtime = "nodejs";
+import { isUserPaid } from "@/lib/auth";
+import { proxyAnthropicRequest } from "@/lib/anthropic-proxy";
+import { hashSecret } from "@/lib/security";
+import { findProjectByProxyHash, findUserById } from "@/lib/storage";
+import { sendSlackAlert } from "@/lib/slack-alerts";
+import { limitStatus, markLimitAlertSent, recordUsage, shouldSendLimitAlert } from "@/lib/usage-tracker";
 
-const ProxyPayloadSchema = z
-  .object({
-    model: z.string().min(1),
-    max_tokens: z.number().int().positive(),
-    messages: z.array(z.any()).min(1)
-  })
-  .passthrough();
+function extractProxyKey(request: NextRequest): string | null {
+  const headerKey = request.headers.get("x-proxy-key");
 
-function extractBearerToken(request: NextRequest): string | null {
-  const header = request.headers.get("authorization");
-
-  if (!header || !header.toLowerCase().startsWith("bearer ")) {
-    return null;
+  if (headerKey) {
+    return headerKey.trim();
   }
 
-  const token = header.slice("bearer ".length).trim();
-  return token.length > 0 ? token : null;
+  const authorization = request.headers.get("authorization");
+
+  if (authorization?.toLowerCase().startsWith("bearer ")) {
+    return authorization.slice(7).trim();
+  }
+
+  return null;
 }
 
-async function notifyExceededCaps(input: {
-  project: {
-    id: string;
-    name: string;
-    slackWebhookUrl: string | null;
-    dailyCapUsd: number;
-    weeklyCapUsd: number;
-    monthlyCapUsd: number;
-  };
-  exceeded: Array<{ window: WindowType; total: number; cap: number }>;
-}): Promise<void> {
-  await Promise.all(
-    input.exceeded.map((item) =>
-      sendCapExceededAlert({
-        project: input.project,
-        windowType: item.window,
-        totalUsd: item.total,
-        capUsd: item.cap
-      }).catch(() => ({ sent: false }))
-    )
-  );
+async function alertIfNeeded(params: {
+  projectId: string;
+  period: "daily" | "weekly" | "monthly";
+  message: string;
+  slackWebhookUrl: string | null;
+}) {
+  const shouldSend = await shouldSendLimitAlert(params.projectId, params.period);
+
+  if (!shouldSend) {
+    return;
+  }
+
+  await markLimitAlertSent({
+    projectId: params.projectId,
+    period: params.period,
+    message: params.message
+  });
+
+  if (params.slackWebhookUrl) {
+    await sendSlackAlert(params.slackWebhookUrl, params.message);
+  }
 }
 
 export async function POST(request: NextRequest) {
-  const proxyKey = extractBearerToken(request);
+  const proxyKey = extractProxyKey(request);
 
   if (!proxyKey) {
     return NextResponse.json(
-      { error: "Missing or invalid Bearer proxy key" },
+      {
+        error: "Proxy key missing. Provide x-proxy-key or Bearer token."
+      },
       { status: 401 }
     );
   }
 
-  const project = await getProjectForProxyKey(proxyKey);
+  const project = await findProjectByProxyHash(hashSecret(proxyKey));
 
   if (!project) {
-    return NextResponse.json({ error: "Invalid proxy key" }, { status: 401 });
+    return NextResponse.json({ error: "Invalid proxy key." }, { status: 401 });
   }
 
-  const paid = await hasActiveSubscription(project.ownerEmail);
+  const user = await findUserById(project.userId);
 
-  if (!paid) {
+  if (!user || !isUserPaid(user)) {
     return NextResponse.json(
       {
-        error:
-          "Subscription inactive. Proxy requests are disabled until billing is active."
+        error: "Project subscription is inactive. Reactivate to continue proxying requests."
       },
       { status: 402 }
+    );
+  }
+
+  const before = await limitStatus(project);
+
+  if (before.exceeded) {
+    const message = `Claude Usage Cap blocked project ${project.name}: ${before.exceeded} cap reached (${before.totals[before.exceeded]} USD used).`;
+
+    await alertIfNeeded({
+      projectId: project.id,
+      period: before.exceeded,
+      message,
+      slackWebhookUrl: project.slackWebhookUrl
+    });
+
+    return NextResponse.json(
+      {
+        error: "usage_cap_exceeded",
+        message: `Usage blocked: ${before.exceeded} spend cap reached.`,
+        totals: before.totals,
+        caps: before.caps
+      },
+      {
+        status: 429,
+        headers: {
+          "x-claude-proxy-project": project.id
+        }
+      }
     );
   }
 
@@ -91,115 +108,53 @@ export async function POST(request: NextRequest) {
   try {
     body = await request.json();
   } catch {
-    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
   }
 
-  const parsed = ProxyPayloadSchema.safeParse(body);
+  const proxied = await proxyAnthropicRequest({
+    project,
+    requestBody: body,
+    requestHeaders: request.headers
+  });
 
-  if (!parsed.success) {
-    return NextResponse.json(
-      { error: "Body must match Anthropic message format" },
-      { status: 400 }
-    );
-  }
-
-  const totalsBefore = await getUsageTotals(project.id);
-  const statusBefore = evaluateCapStatus(project, totalsBefore);
-
-  if (statusBefore.exceeded.length > 0) {
-    await notifyExceededCaps({
-      project,
-      exceeded: statusBefore.exceeded
-    });
-
-    return NextResponse.json(
-      {
-        error: "Spend cap exceeded for this project. Proxy access is temporarily blocked.",
-        caps: {
-          daily: project.dailyCapUsd,
-          weekly: project.weeklyCapUsd,
-          monthly: project.monthlyCapUsd
-        },
-        totals: totalsBefore,
-        exceeded: statusBefore.exceeded
-      },
-      { status: 429 }
-    );
-  }
-
-  try {
-    const anthropicResponse = await sendClaudeRequest({
-      anthropicApiKey: project.anthropicApiKey,
-      payload: parsed.data
-    });
-
-    const usage = (anthropicResponse.usage ?? {}) as Record<string, unknown>;
-    const model =
-      (typeof anthropicResponse.model === "string" && anthropicResponse.model) ||
-      parsed.data.model;
-
-    const inputTokens = Number(usage.input_tokens ?? 0);
-    const outputTokens = Number(usage.output_tokens ?? 0);
-    const cacheCreationTokens = Number(
-      usage.cache_creation_input_tokens ?? usage.cache_creation_tokens ?? 0
-    );
-    const cacheReadTokens = Number(
-      usage.cache_read_input_tokens ?? usage.cache_read_tokens ?? 0
-    );
-
-    const estimatedCostUsd = estimateClaudeCostUsd(model, {
-      input_tokens: inputTokens,
-      output_tokens: outputTokens,
-      cache_creation_input_tokens: cacheCreationTokens,
-      cache_read_input_tokens: cacheReadTokens
-    });
-
-    await recordUsageEvent({
+  if (proxied.usage) {
+    await recordUsage({
       projectId: project.id,
-      model,
-      inputTokens,
-      outputTokens,
-      cacheCreationTokens,
-      cacheReadTokens,
-      costUsd: estimatedCostUsd
+      requestId: proxied.usage.requestId,
+      model: proxied.usage.model,
+      inputTokens: proxied.usage.inputTokens,
+      outputTokens: proxied.usage.outputTokens,
+      costUsd: proxied.usage.costUsd
     });
 
-    const totalsAfter = await getUsageTotals(project.id);
-    const statusAfter = evaluateCapStatus(project, totalsAfter);
+    const after = await limitStatus(project);
 
-    if (statusAfter.exceeded.length > 0) {
-      await notifyExceededCaps({ project, exceeded: statusAfter.exceeded });
+    if (after.exceeded) {
+      const message = `Claude Usage Cap alert for ${project.name}: ${after.exceeded} cap reached. Blocking subsequent calls until next billing window.`;
+
+      await alertIfNeeded({
+        projectId: project.id,
+        period: after.exceeded,
+        message,
+        slackWebhookUrl: project.slackWebhookUrl
+      });
     }
-
-    const response = NextResponse.json(anthropicResponse);
-    response.headers.set("x-claw-request-cost-usd", estimatedCostUsd.toFixed(6));
-    response.headers.set("x-claw-day-spend-usd", totalsAfter.day.toFixed(6));
-    response.headers.set("x-claw-week-spend-usd", totalsAfter.week.toFixed(6));
-    response.headers.set("x-claw-month-spend-usd", totalsAfter.month.toFixed(6));
-
-    return response;
-  } catch (error: unknown) {
-    const status =
-      typeof error === "object" &&
-      error !== null &&
-      "status" in error &&
-      typeof (error as { status?: unknown }).status === "number"
-        ? ((error as { status: number }).status ?? 500)
-        : 500;
-
-    const message =
-      typeof error === "object" &&
-      error !== null &&
-      "message" in error &&
-      typeof (error as { message?: unknown }).message === "string"
-        ? (error as { message: string }).message
-        : "Anthropic proxy request failed";
-
-    return NextResponse.json(
-      {
-        error: message
-      },
-      { status }
-    );
   }
+
+  if (typeof proxied.body === "string") {
+    return new NextResponse(proxied.body, {
+      status: proxied.status,
+      headers: {
+        "content-type": "application/json",
+        "x-claude-proxy-project": project.id
+      }
+    });
+  }
+
+  return NextResponse.json(proxied.body, {
+    status: proxied.status,
+    headers: {
+      "x-claude-proxy-project": project.id
+    }
+  });
 }

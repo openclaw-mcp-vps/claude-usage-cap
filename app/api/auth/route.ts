@@ -1,88 +1,85 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import {
-  clearSessionCookie,
-  getSessionFromRequest,
-  setSessionCookie
-} from "@/lib/auth";
-import {
-  buildLemonCheckoutUrl,
-  getSubscriptionByEmail,
-  isSubscriptionActiveStatus
-} from "@/lib/lemonsqueezy";
 
-const AuthRequestSchema = z.object({
-  email: z.string().email()
+import { attachSession, clearSession, getOrCreateUser, getUserFromRequest, isUserPaid } from "@/lib/auth";
+import { buildCheckoutUrl } from "@/lib/lemonsqueezy";
+
+const signInSchema = z.object({
+  action: z.literal("sign-in"),
+  email: z.string().trim().email()
 });
 
+const signOutSchema = z.object({
+  action: z.literal("sign-out")
+});
+
+const actionSchema = z.union([signInSchema, signOutSchema]);
+
 export async function GET(request: NextRequest) {
-  const session = getSessionFromRequest(request);
+  const user = await getUserFromRequest(request);
 
-  if (!session) {
-    return NextResponse.json({ authenticated: false }, { status: 401 });
+  if (!user) {
+    return NextResponse.json({
+      authenticated: false,
+      user: null,
+      checkoutUrl: null
+    });
   }
-
-  const subscription = await getSubscriptionByEmail(session.email);
 
   return NextResponse.json({
     authenticated: true,
-    email: session.email,
-    subscriptionActive: isSubscriptionActiveStatus(subscription?.status),
-    subscriptionStatus: subscription?.status ?? "none"
+    user: {
+      id: user.id,
+      email: user.email,
+      paidUntil: user.paidUntil,
+      subscriptionStatus: user.subscriptionStatus,
+      isPaid: isUserPaid(user)
+    },
+    checkoutUrl: buildCheckoutUrl({
+      userId: user.id,
+      email: user.email
+    })
   });
 }
 
 export async function POST(request: NextRequest) {
-  let payload: unknown;
+  let body: unknown;
 
   try {
-    payload = await request.json();
+    body = await request.json();
   } catch {
-    return NextResponse.json(
-      { error: "Invalid JSON body" },
-      {
-        status: 400
-      }
-    );
+    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
   }
 
-  const parsed = AuthRequestSchema.safeParse(payload);
+  const parsed = actionSchema.safeParse(body);
 
   if (!parsed.success) {
-    return NextResponse.json(
-      { error: "A valid billing email is required" },
-      { status: 400 }
-    );
+    return NextResponse.json({ error: "Invalid auth payload." }, { status: 400 });
   }
 
-  const email = parsed.data.email.toLowerCase();
-  const subscription = await getSubscriptionByEmail(email);
-  const active = isSubscriptionActiveStatus(subscription?.status);
-
-  if (!active) {
-    return NextResponse.json(
-      {
-        error:
-          "No active subscription found for this email. Complete checkout first, then unlock access.",
-        checkoutUrl: buildLemonCheckoutUrl(email)
-      },
-      { status: 402 }
-    );
+  if (parsed.data.action === "sign-out") {
+    const response = NextResponse.json({ ok: true });
+    clearSession(response);
+    return response;
   }
+
+  const user = await getOrCreateUser(parsed.data.email);
 
   const response = NextResponse.json({
-    authenticated: true,
-    email,
-    subscriptionStatus: subscription?.status ?? "active"
+    ok: true,
+    user: {
+      id: user.id,
+      email: user.email,
+      paidUntil: user.paidUntil,
+      subscriptionStatus: user.subscriptionStatus,
+      isPaid: isUserPaid(user)
+    },
+    checkoutUrl: buildCheckoutUrl({
+      userId: user.id,
+      email: user.email
+    })
   });
 
-  setSessionCookie(response, email);
-
-  return response;
-}
-
-export async function DELETE() {
-  const response = NextResponse.json({ authenticated: false });
-  clearSessionCookie(response);
+  await attachSession(response, user);
   return response;
 }

@@ -1,96 +1,209 @@
+"use client";
+
 import Link from "next/link";
-import { notFound, redirect } from "next/navigation";
-import { ProjectSettings } from "@/components/ProjectSettings";
+import { useParams, useRouter } from "next/navigation";
+import { useEffect, useMemo, useState } from "react";
+import { ArrowLeft, Copy, Trash2 } from "lucide-react";
+
+import { LimitSettings } from "@/components/LimitSettings";
 import { UsageChart } from "@/components/UsageChart";
-import { getSessionFromServerCookies } from "@/lib/auth";
-import { hasActiveSubscription } from "@/lib/lemonsqueezy";
-import { getProjectForOwner } from "@/lib/projects";
-import {
-  evaluateCapStatus,
-  getDailyUsageSeries,
-  getUsageTotals
-} from "@/lib/usage-tracker";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { formatUsd } from "@/lib/utils";
 
-export const dynamic = "force-dynamic";
+type ProjectDetail = {
+  id: string;
+  name: string;
+  proxyKeyPrefix: string;
+  caps: {
+    dailyUsd: number;
+    weeklyUsd: number;
+    monthlyUsd: number;
+  };
+  totals: {
+    daily: number;
+    weekly: number;
+    monthly: number;
+  };
+  exceeded: "daily" | "weekly" | "monthly" | null;
+  slackWebhookUrl: string | null;
+  usageSeries: Array<{ date: string; costUsd: number }>;
+  proxyEndpoint: string;
+};
 
-export default async function ProjectPage({
-  params
-}: {
-  params: Promise<{ id: string }>;
-}) {
-  const session = await getSessionFromServerCookies();
+export default function ProjectPage() {
+  const router = useRouter();
+  const params = useParams<{ id: string }>();
+  const [project, setProject] = useState<ProjectDetail | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
-  if (!session) {
-    redirect("/");
+  async function loadProject() {
+    if (!params.id) {
+      return;
+    }
+
+    const response = await fetch(`/api/projects?id=${params.id}`, { cache: "no-store" });
+    const json = (await response.json()) as { project?: ProjectDetail; error?: string };
+
+    if (!response.ok || !json.project) {
+      setError(json.error || "Project not found.");
+      setLoading(false);
+      return;
+    }
+
+    setProject(json.project);
+    setLoading(false);
   }
 
-  const activeSubscription = await hasActiveSubscription(session.email);
+  useEffect(() => {
+    void loadProject();
+  }, [params.id]);
 
-  if (!activeSubscription) {
-    redirect(`/?email=${encodeURIComponent(session.email)}`);
+  const usageSnippet = useMemo(() => {
+    if (!project) {
+      return "";
+    }
+
+    return `curl ${project.proxyEndpoint} \\
+  -H "x-proxy-key: <your-project-proxy-key>" \\
+  -H "content-type: application/json" \\
+  -d '{"model":"claude-3-5-sonnet-latest","max_tokens":400,"messages":[{"role":"user","content":"Hello"}]}'`;
+  }, [project]);
+
+  async function deleteProject() {
+    if (!project) {
+      return;
+    }
+
+    const confirmed = window.confirm(`Delete project \"${project.name}\"? This removes usage history and cannot be undone.`);
+
+    if (!confirmed) {
+      return;
+    }
+
+    const response = await fetch("/api/projects", {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id: project.id })
+    });
+
+    if (!response.ok) {
+      const json = (await response.json()) as { error?: string };
+      window.alert(json.error || "Failed to delete project.");
+      return;
+    }
+
+    router.push("/dashboard");
   }
 
-  const resolvedParams = await params;
-  const project = await getProjectForOwner(session.email, resolvedParams.id);
-
-  if (!project) {
-    notFound();
+  async function copySnippet() {
+    await navigator.clipboard.writeText(usageSnippet);
   }
 
-  const [totals, series] = await Promise.all([
-    getUsageTotals(project.id),
-    getDailyUsageSeries(project.id, 30)
-  ]);
+  if (loading) {
+    return <main className="mx-auto max-w-6xl px-6 py-12 text-sm text-[#9da7b3]">Loading project...</main>;
+  }
 
-  const capStatus = evaluateCapStatus(project, totals);
+  if (error || !project) {
+    return (
+      <main className="mx-auto max-w-2xl px-6 py-12">
+        <Card>
+          <CardHeader>
+            <CardTitle>Project unavailable</CardTitle>
+            <CardDescription>{error || "Unable to load this project."}</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Link href="/dashboard" className="text-sm text-[#2f81f7] hover:underline">
+              Back to dashboard
+            </Link>
+          </CardContent>
+        </Card>
+      </main>
+    );
+  }
 
   return (
-    <main className="mx-auto min-h-screen w-full max-w-6xl px-4 pb-16 pt-10 md:px-6">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <Link href="/dashboard" className="text-sm text-[#9ca3af] transition hover:text-[#22c55e]">
-            ← Back to dashboard
+    <main className="mx-auto w-full max-w-6xl space-y-6 px-6 py-10">
+      <header className="flex flex-wrap items-center justify-between gap-3">
+        <div className="space-y-1">
+          <Link href="/dashboard" className="inline-flex items-center text-sm text-[#9da7b3] hover:text-[#e6edf3]">
+            <ArrowLeft size={14} className="mr-1" />
+            Dashboard
           </Link>
-          <h1 className="mt-2 text-3xl font-bold">{project.name}</h1>
+          <h1 className="text-3xl font-semibold">{project.name}</h1>
+          <p className="text-sm text-[#9da7b3]">Proxy key prefix: {project.proxyKeyPrefix}</p>
         </div>
-      </div>
+        <Button variant="danger" onClick={deleteProject}>
+          <Trash2 className="mr-2" size={16} />
+          Delete project
+        </Button>
+      </header>
 
-      <section className="mt-6 grid gap-4 sm:grid-cols-3">
-        <div className="rounded-xl border border-[#1f2937] bg-[#111827]/80 p-4">
-          <div className="text-xs uppercase tracking-wide text-[#9ca3af]">Today</div>
-          <div className="mt-2 text-2xl font-bold">${totals.day.toFixed(3)}</div>
-          <div className="mt-1 text-xs text-[#9ca3af]">Cap ${project.dailyCapUsd.toFixed(2)}</div>
-        </div>
-
-        <div className="rounded-xl border border-[#1f2937] bg-[#111827]/80 p-4">
-          <div className="text-xs uppercase tracking-wide text-[#9ca3af]">This Week</div>
-          <div className="mt-2 text-2xl font-bold">${totals.week.toFixed(3)}</div>
-          <div className="mt-1 text-xs text-[#9ca3af]">Cap ${project.weeklyCapUsd.toFixed(2)}</div>
-        </div>
-
-        <div className="rounded-xl border border-[#1f2937] bg-[#111827]/80 p-4">
-          <div className="text-xs uppercase tracking-wide text-[#9ca3af]">This Month</div>
-          <div className="mt-2 text-2xl font-bold">${totals.month.toFixed(3)}</div>
-          <div className="mt-1 text-xs text-[#9ca3af]">Cap ${project.monthlyCapUsd.toFixed(2)}</div>
-        </div>
+      <section className="grid gap-4 sm:grid-cols-3">
+        <Card>
+          <CardHeader>
+            <CardDescription>Daily spend</CardDescription>
+            <CardTitle>
+              {formatUsd(project.totals.daily)} / {formatUsd(project.caps.dailyUsd)}
+            </CardTitle>
+          </CardHeader>
+        </Card>
+        <Card>
+          <CardHeader>
+            <CardDescription>Weekly spend</CardDescription>
+            <CardTitle>
+              {formatUsd(project.totals.weekly)} / {formatUsd(project.caps.weeklyUsd)}
+            </CardTitle>
+          </CardHeader>
+        </Card>
+        <Card>
+          <CardHeader>
+            <CardDescription>Monthly spend</CardDescription>
+            <CardTitle>
+              {formatUsd(project.totals.monthly)} / {formatUsd(project.caps.monthlyUsd)}
+            </CardTitle>
+          </CardHeader>
+        </Card>
       </section>
 
-      {capStatus.exceeded.length > 0 ? (
-        <div className="mt-4 rounded-xl border border-[#7f1d1d] bg-[#450a0a]/50 p-4 text-sm text-[#fca5a5]">
-          Proxy is currently blocking requests. Exceeded windows:{" "}
-          {capStatus.exceeded.map((entry) => entry.window).join(", ")}.
-        </div>
-      ) : (
-        <div className="mt-4 rounded-xl border border-[#14532d] bg-[#052e16]/40 p-4 text-sm text-[#bbf7d0]">
-          Proxy is active. Remaining budget: Day ${capStatus.remaining.day.toFixed(2)}, Week $
-          {capStatus.remaining.week.toFixed(2)}, Month ${capStatus.remaining.month.toFixed(2)}.
-        </div>
-      )}
+      {project.exceeded ? (
+        <Card className="border-[#f85149]">
+          <CardContent className="pt-6 text-sm text-[#f85149]">
+            Requests are currently blocked because the <strong>{project.exceeded}</strong> cap has been reached.
+          </CardContent>
+        </Card>
+      ) : null}
 
-      <section className="mt-6 grid gap-5 lg:grid-cols-[1.1fr_1fr]">
-        <UsageChart data={series} />
-        <ProjectSettings project={project} />
-      </section>
+      <UsageChart data={project.usageSeries} />
+
+      <LimitSettings
+        projectId={project.id}
+        initial={{
+          dailyUsd: project.caps.dailyUsd,
+          weeklyUsd: project.caps.weeklyUsd,
+          monthlyUsd: project.caps.monthlyUsd,
+          slackWebhookUrl: project.slackWebhookUrl
+        }}
+      />
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Proxy usage snippet</CardTitle>
+          <CardDescription>
+            Replace your direct Claude API call with this proxy endpoint and the project proxy key.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <pre className="overflow-x-auto rounded-md border border-[#30363d] bg-[#0d1117] p-3 text-xs text-[#9da7b3]">
+            {usageSnippet}
+          </pre>
+          <Button variant="outline" onClick={copySnippet}>
+            <Copy className="mr-2" size={16} />
+            Copy snippet
+          </Button>
+        </CardContent>
+      </Card>
     </main>
   );
 }
