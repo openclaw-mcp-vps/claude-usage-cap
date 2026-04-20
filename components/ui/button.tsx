@@ -1,37 +1,41 @@
 import * as React from "react";
+import { cva, type VariantProps } from "class-variance-authority";
 
 import { cn } from "@/lib/utils";
 
-type ButtonVariant = "default" | "outline" | "ghost" | "danger";
+const buttonVariants = cva(
+  "inline-flex items-center justify-center gap-2 rounded-md text-sm font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 disabled:pointer-events-none disabled:opacity-50",
+  {
+    variants: {
+      variant: {
+        default: "bg-sky-500 text-slate-950 hover:bg-sky-400",
+        outline: "border border-slate-700 bg-slate-900 text-slate-100 hover:bg-slate-800",
+        ghost: "text-slate-200 hover:bg-slate-800"
+      },
+      size: {
+        default: "h-10 px-4 py-2",
+        sm: "h-8 rounded-md px-3 text-xs",
+        lg: "h-11 rounded-md px-6 text-sm"
+      }
+    },
+    defaultVariants: {
+      variant: "default",
+      size: "default"
+    }
+  }
+);
 
-type ButtonProps = React.ButtonHTMLAttributes<HTMLButtonElement> & {
-  variant?: ButtonVariant;
-};
+export interface ButtonProps
+  extends React.ButtonHTMLAttributes<HTMLButtonElement>,
+    VariantProps<typeof buttonVariants> {
+  asChild?: boolean;
+}
 
-const variants: Record<ButtonVariant, string> = {
-  default:
-    "bg-[#2f81f7] text-[#f0f6fc] hover:bg-[#1f6feb] border border-[#2f81f7] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#2f81f7]/50",
-  outline:
-    "bg-transparent text-[#e6edf3] border border-[#30363d] hover:border-[#2f81f7] hover:text-[#2f81f7]",
-  ghost: "bg-transparent text-[#e6edf3] border border-transparent hover:bg-[#161b22]",
-  danger:
-    "bg-[#f85149] text-white border border-[#f85149] hover:bg-[#da3633] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#f85149]/50"
-};
+const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
+  ({ className, variant, size, ...props }, ref) => {
+    return <button className={cn(buttonVariants({ variant, size }), className)} ref={ref} {...props} />;
+  }
+);
+Button.displayName = "Button";
 
-export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(function Button(
-  { className, variant = "default", type = "button", ...props },
-  ref
-) {
-  return (
-    <button
-      ref={ref}
-      type={type}
-      className={cn(
-        "inline-flex h-10 items-center justify-center rounded-md px-4 text-sm font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-60",
-        variants[variant],
-        className
-      )}
-      {...props}
-    />
-  );
-});
+export { Button, buttonVariants };

@@ -1,76 +1,55 @@
-import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import { getSessionFromRequest } from "@/lib/auth";
-import { hasActiveSubscription } from "@/lib/lemonsqueezy";
-import { getProjectForOwner } from "@/lib/projects";
-import {
-  evaluateCapStatus,
-  getDailyUsageSeries,
-  getUsageTotals
-} from "@/lib/usage-tracker";
 
-const querySchema = z.object({
+import { getProjectById } from "@/lib/db";
+import { buildDailyUsageSeries, evaluateCapState, getCurrentSpend } from "@/lib/usage-tracker";
+
+const usageQuerySchema = z.object({
   projectId: z.string().uuid(),
-  days: z
-    .string()
-    .optional()
-    .transform((value) => {
-      if (!value) {
-        return 30;
-      }
-
-      const parsed = Number(value);
-
-      if (!Number.isFinite(parsed)) {
-        return 30;
-      }
-
-      return Math.max(7, Math.min(90, Math.floor(parsed)));
-    })
+  days: z.coerce.number().int().min(7).max(90).default(30)
 });
 
-export async function GET(request: NextRequest) {
-  const session = getSessionFromRequest(request);
+export const runtime = "nodejs";
 
-  if (!session) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
-  const paid = await hasActiveSubscription(session.email);
-
-  if (!paid) {
-    return NextResponse.json(
-      { error: "Active subscription required." },
-      { status: 402 }
-    );
-  }
-
-  const parsed = querySchema.safeParse({
-    projectId: request.nextUrl.searchParams.get("projectId"),
-    days: request.nextUrl.searchParams.get("days") ?? undefined
+export async function GET(request: Request) {
+  const url = new URL(request.url);
+  const parsed = usageQuerySchema.safeParse({
+    projectId: url.searchParams.get("projectId"),
+    days: url.searchParams.get("days") || "30"
   });
 
   if (!parsed.success) {
-    return NextResponse.json({ error: "projectId is required" }, { status: 400 });
+    return Response.json(
+      {
+        error: "Invalid projectId or days query parameters.",
+        details: parsed.error.flatten()
+      },
+      { status: 400 }
+    );
   }
 
-  const project = await getProjectForOwner(session.email, parsed.data.projectId);
+  const project = getProjectById(parsed.data.projectId);
 
   if (!project) {
-    return NextResponse.json({ error: "Project not found" }, { status: 404 });
+    return Response.json({ error: "Project not found." }, { status: 404 });
   }
 
-  const [totals, series] = await Promise.all([
-    getUsageTotals(project.id),
-    getDailyUsageSeries(project.id, parsed.data.days)
-  ]);
+  const spend = getCurrentSpend(project.id);
+  const cap = evaluateCapState({
+    caps: {
+      dailyCap: project.dailyCap,
+      weeklyCap: project.weeklyCap,
+      monthlyCap: project.monthlyCap
+    },
+    spend: {
+      daily: spend.daily,
+      weekly: spend.weekly,
+      monthly: spend.monthly
+    }
+  });
 
-  const capStatus = evaluateCapStatus(project, totals);
-
-  return NextResponse.json({
-    project,
-    totals,
-    capStatus,
-    series
+  return Response.json({
+    projectId: project.id,
+    capStatus: cap.states,
+    series: buildDailyUsageSeries(project.id, parsed.data.days)
   });
 }

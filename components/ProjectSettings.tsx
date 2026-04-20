@@ -1,206 +1,185 @@
 "use client";
 
-import { useState } from "react";
-import { AlertTriangle, KeyRound, Save, ShieldCheck } from "lucide-react";
+import { type FormEvent, useState } from "react";
+import { useRouter } from "next/navigation";
 
-type ProjectSettingsModel = {
-  id: string;
-  name: string;
-  slackWebhookUrl: string | null;
-  dailyCapUsd: number;
-  weeklyCapUsd: number;
-  monthlyCapUsd: number;
-  proxyKeyLast4: string;
-};
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 
-export function ProjectSettings({ project }: { project: ProjectSettingsModel }) {
-  const [name, setName] = useState(project.name);
-  const [anthropicApiKey, setAnthropicApiKey] = useState("");
-  const [slackWebhookUrl, setSlackWebhookUrl] = useState(project.slackWebhookUrl ?? "");
-  const [dailyCapUsd, setDailyCapUsd] = useState(String(project.dailyCapUsd));
-  const [weeklyCapUsd, setWeeklyCapUsd] = useState(String(project.weeklyCapUsd));
-  const [monthlyCapUsd, setMonthlyCapUsd] = useState(String(project.monthlyCapUsd));
-  const [submitting, setSubmitting] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
-  const [newProxyKey, setNewProxyKey] = useState<string | null>(null);
+export function ProjectSettings() {
+  const router = useRouter();
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [proxyKey, setProxyKey] = useState("");
+  const [form, setForm] = useState({
+    name: "",
+    anthropicApiKey: "",
+    dailyCap: "20",
+    weeklyCap: "80",
+    monthlyCap: "300",
+    slackBotToken: "",
+    slackChannel: ""
+  });
 
-  async function updateSettings() {
-    setSubmitting(true);
-    setMessage(null);
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError("");
+    setProxyKey("");
+    setLoading(true);
 
     try {
       const response = await fetch("/api/projects", {
-        method: "PATCH",
-        headers: {
-          "Content-Type": "application/json"
-        },
+        method: "POST",
+        headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          id: project.id,
-          name,
-          anthropicApiKey: anthropicApiKey || undefined,
-          slackWebhookUrl,
-          caps: {
-            dailyCapUsd: Number(dailyCapUsd),
-            weeklyCapUsd: Number(weeklyCapUsd),
-            monthlyCapUsd: Number(monthlyCapUsd)
-          }
+          ...form,
+          dailyCap: Number(form.dailyCap),
+          weeklyCap: Number(form.weeklyCap),
+          monthlyCap: Number(form.monthlyCap)
         })
       });
 
-      const data = (await response.json()) as { error?: string };
+      const body = (await response.json()) as { error?: string; proxyKey?: string };
 
       if (!response.ok) {
-        throw new Error(data.error ?? "Failed to update project settings");
+        setError(body.error || "Could not create project.");
+        return;
       }
 
-      setAnthropicApiKey("");
-      setMessage("Project settings saved.");
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Failed to update project settings");
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
-  async function rotateProxyKey() {
-    setSubmitting(true);
-    setMessage(null);
-
-    try {
-      const response = await fetch("/api/projects", {
-        method: "PATCH",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          id: project.id,
-          rotateProxyKey: true
-        })
-      });
-
-      const data = (await response.json()) as { proxyKey?: string; error?: string };
-
-      if (!response.ok || !data.proxyKey) {
-        throw new Error(data.error ?? "Failed to rotate proxy key");
+      if (body.proxyKey) {
+        setProxyKey(body.proxyKey);
       }
 
-      setNewProxyKey(data.proxyKey);
-      setMessage("Proxy key rotated. Update your workloads immediately.");
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Failed to rotate proxy key");
+      setForm((current) => ({
+        ...current,
+        name: "",
+        anthropicApiKey: ""
+      }));
+      router.refresh();
+    } catch {
+      setError("Network error while creating project.");
     } finally {
-      setSubmitting(false);
+      setLoading(false);
     }
   }
 
   return (
-    <div className="space-y-4 rounded-2xl border border-[#1f2937] bg-[#111827]/80 p-5">
-      <div className="flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-[#9ca3af]">
-        <ShieldCheck size={16} />
-        Project Settings
-      </div>
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-white">Create project guardrail</CardTitle>
+        <CardDescription>Register an Anthropic key, define caps, and receive one proxy key for your app.</CardDescription>
+      </CardHeader>
+      <CardContent>
+        <form className="grid gap-4" onSubmit={submit}>
+          <div className="grid gap-2">
+            <Label htmlFor="name">Project name</Label>
+            <Input
+              id="name"
+              value={form.name}
+              onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))}
+              placeholder="Internal Search Agent"
+              required
+            />
+          </div>
 
-      <label className="flex flex-col gap-2 text-sm text-[#cbd5e1]">
-        Project Name
-        <input
-          value={name}
-          onChange={(event) => setName(event.target.value)}
-          className="rounded-lg border border-[#334155] bg-[#0f172a] px-3 py-2 text-[#e6edf3] outline-none transition focus:border-[#22c55e]"
-        />
-      </label>
+          <div className="grid gap-2">
+            <Label htmlFor="anthropic-api-key">Anthropic API key</Label>
+            <Input
+              id="anthropic-api-key"
+              type="password"
+              value={form.anthropicApiKey}
+              onChange={(event) => setForm((current) => ({ ...current, anthropicApiKey: event.target.value }))}
+              placeholder="sk-ant-api03-..."
+              required
+            />
+          </div>
 
-      <label className="flex flex-col gap-2 text-sm text-[#cbd5e1]">
-        Anthropic API Key
-        <input
-          value={anthropicApiKey}
-          onChange={(event) => setAnthropicApiKey(event.target.value)}
-          placeholder="Paste a new key only when rotating credentials"
-          className="rounded-lg border border-[#334155] bg-[#0f172a] px-3 py-2 text-[#e6edf3] outline-none transition focus:border-[#22c55e]"
-        />
-      </label>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+            <CapField
+              id="daily-cap"
+              label="Daily cap (USD)"
+              value={form.dailyCap}
+              onChange={(value) => setForm((current) => ({ ...current, dailyCap: value }))}
+            />
+            <CapField
+              id="weekly-cap"
+              label="Weekly cap (USD)"
+              value={form.weeklyCap}
+              onChange={(value) => setForm((current) => ({ ...current, weeklyCap: value }))}
+            />
+            <CapField
+              id="monthly-cap"
+              label="Monthly cap (USD)"
+              value={form.monthlyCap}
+              onChange={(value) => setForm((current) => ({ ...current, monthlyCap: value }))}
+            />
+          </div>
 
-      <label className="flex flex-col gap-2 text-sm text-[#cbd5e1]">
-        Slack Alert Webhook URL
-        <input
-          value={slackWebhookUrl}
-          onChange={(event) => setSlackWebhookUrl(event.target.value)}
-          placeholder="https://hooks.slack.com/services/..."
-          className="rounded-lg border border-[#334155] bg-[#0f172a] px-3 py-2 text-[#e6edf3] outline-none transition focus:border-[#22c55e]"
-        />
-      </label>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <div className="grid gap-2">
+              <Label htmlFor="slack-token">Slack bot token (optional)</Label>
+              <Input
+                id="slack-token"
+                type="password"
+                value={form.slackBotToken}
+                onChange={(event) => setForm((current) => ({ ...current, slackBotToken: event.target.value }))}
+                placeholder="xoxb-..."
+              />
+            </div>
+            <div className="grid gap-2">
+              <Label htmlFor="slack-channel">Slack channel ID (optional)</Label>
+              <Input
+                id="slack-channel"
+                value={form.slackChannel}
+                onChange={(event) => setForm((current) => ({ ...current, slackChannel: event.target.value }))}
+                placeholder="C01234567"
+              />
+            </div>
+          </div>
 
-      <div className="grid gap-3 md:grid-cols-3">
-        <label className="flex flex-col gap-2 text-sm text-[#cbd5e1]">
-          Daily Cap (USD)
-          <input
-            type="number"
-            min={0.5}
-            step="0.5"
-            value={dailyCapUsd}
-            onChange={(event) => setDailyCapUsd(event.target.value)}
-            className="rounded-lg border border-[#334155] bg-[#0f172a] px-3 py-2 text-[#e6edf3] outline-none transition focus:border-[#22c55e]"
-          />
-        </label>
-        <label className="flex flex-col gap-2 text-sm text-[#cbd5e1]">
-          Weekly Cap (USD)
-          <input
-            type="number"
-            min={0.5}
-            step="0.5"
-            value={weeklyCapUsd}
-            onChange={(event) => setWeeklyCapUsd(event.target.value)}
-            className="rounded-lg border border-[#334155] bg-[#0f172a] px-3 py-2 text-[#e6edf3] outline-none transition focus:border-[#22c55e]"
-          />
-        </label>
-        <label className="flex flex-col gap-2 text-sm text-[#cbd5e1]">
-          Monthly Cap (USD)
-          <input
-            type="number"
-            min={0.5}
-            step="0.5"
-            value={monthlyCapUsd}
-            onChange={(event) => setMonthlyCapUsd(event.target.value)}
-            className="rounded-lg border border-[#334155] bg-[#0f172a] px-3 py-2 text-[#e6edf3] outline-none transition focus:border-[#22c55e]"
-          />
-        </label>
-      </div>
+          {error ? <p className="text-sm text-red-400">{error}</p> : null}
 
-      <div className="rounded-lg border border-[#334155] bg-[#0f172a] px-4 py-3 text-sm text-[#cbd5e1]">
-        Active proxy key ends with <span className="font-mono">{project.proxyKeyLast4}</span>
-      </div>
+          {proxyKey ? (
+            <div className="rounded-lg border border-emerald-700/50 bg-emerald-950/30 p-3 text-sm text-emerald-200">
+              <p className="font-semibold">Proxy key (copy now, shown only once)</p>
+              <code className="mt-1 block break-all rounded bg-emerald-950/60 p-2 font-mono text-xs">{proxyKey}</code>
+            </div>
+          ) : null}
 
-      <div className="flex flex-wrap gap-3">
-        <button
-          onClick={updateSettings}
-          disabled={submitting}
-          className="inline-flex items-center gap-2 rounded-lg bg-[#22c55e] px-4 py-2 text-sm font-semibold text-[#04120a] transition hover:bg-[#16a34a] disabled:opacity-50"
-        >
-          <Save size={16} />
-          Save Settings
-        </button>
+          <Button type="submit" disabled={loading}>
+            {loading ? "Creating project..." : "Create Project"}
+          </Button>
+        </form>
+      </CardContent>
+    </Card>
+  );
+}
 
-        <button
-          onClick={rotateProxyKey}
-          disabled={submitting}
-          className="inline-flex items-center gap-2 rounded-lg border border-[#f59e0b] bg-[#2a1f09] px-4 py-2 text-sm font-semibold text-[#fbbf24] transition hover:bg-[#3a2d10] disabled:opacity-50"
-        >
-          <KeyRound size={16} />
-          Rotate Proxy Key
-        </button>
-      </div>
-
-      {newProxyKey ? (
-        <div className="rounded-lg border border-[#14532d] bg-[#052e16] px-4 py-3 text-sm text-[#bbf7d0]">
-          New proxy key (shown once): <span className="font-mono">{newProxyKey}</span>
-        </div>
-      ) : null}
-
-      {message ? (
-        <div className="inline-flex items-center gap-2 rounded-lg border border-[#334155] bg-[#0f172a] px-3 py-2 text-sm text-[#cbd5e1]">
-          <AlertTriangle size={15} />
-          {message}
-        </div>
-      ) : null}
+function CapField({
+  id,
+  label,
+  value,
+  onChange
+}: {
+  id: string;
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <div className="grid gap-2">
+      <Label htmlFor={id}>{label}</Label>
+      <Input
+        id={id}
+        type="number"
+        min={1}
+        step="0.01"
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        required
+      />
     </div>
   );
 }

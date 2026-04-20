@@ -1,258 +1,185 @@
-"use client";
-
 import Link from "next/link";
-import { useRouter } from "next/navigation";
-import { AlertTriangle, LineChart, Lock, ShieldAlert, Slack, Zap } from "lucide-react";
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { AlertTriangle, BarChart3, Bolt, CheckCircle2, ShieldAlert, Slack } from "lucide-react";
+import type { ComponentType } from "react";
 
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 
-type SessionResponse = {
-  authenticated: boolean;
-  checkoutUrl: string | null;
-  user: {
-    id: string;
-    email: string;
-    isPaid: boolean;
-  } | null;
-};
-
-const faq = [
+const faqs = [
   {
-    question: "How is spend calculated?",
-    answer:
-      "Every proxied Claude response reports token usage. We apply model-level per-million token pricing and store a per-request USD event so your daily, weekly, and monthly totals are exact and auditable."
+    q: "How does cutoff work?",
+    a: "Every request to Claude goes through your project proxy key. Before forwarding, we check period spend totals in real time. If a cap is reached, the proxy immediately returns 429 and your workload stops." 
   },
   {
-    question: "What happens when a cap is hit?",
-    answer:
-      "The proxy immediately returns HTTP 429 with a cap error payload. It also sends one Slack alert per period so your team knows requests are blocked before costs grow further."
+    q: "Does this replace Anthropic billing?",
+    a: "No. Anthropic remains the billing provider. Claude Usage Cap is a guardrail layer that blocks requests once your configured project cap is exhausted." 
   },
   {
-    question: "Can I use different caps per project?",
-    answer:
-      "Yes. Each project gets its own Anthropic key, proxy key, daily/weekly/monthly caps, and optional Slack webhook."
+    q: "What if I run multiple apps on one Anthropic account?",
+    a: "Create one project per app, service, or environment. Each gets its own proxy key and independent daily, weekly, and monthly caps." 
   },
   {
-    question: "Do you store my Anthropic API key in plain text?",
-    answer:
-      "No. Keys are encrypted at rest before persistence. Runtime decryption only happens inside proxy execution when forwarding a request."
+    q: "How quickly do Slack alerts fire?",
+    a: "The alert is sent when the first blocked request occurs for an exceeded period. We deduplicate alerts per period window to avoid spam." 
   }
 ];
 
-export default function LandingPage() {
-  const router = useRouter();
-  const [email, setEmail] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [session, setSession] = useState<SessionResponse | null>(null);
+const paymentLink = process.env.NEXT_PUBLIC_STRIPE_PAYMENT_LINK as string;
 
-  useEffect(() => {
-    void (async () => {
-      const response = await fetch("/api/auth", { cache: "no-store" });
-      const json = (await response.json()) as SessionResponse;
-      setSession(json);
-    })();
-  }, []);
-
-  const checkoutUrl = useMemo(() => session?.checkoutUrl || null, [session]);
-
-  async function signIn(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setError(null);
-    setLoading(true);
-
-    const response = await fetch("/api/auth", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json"
-      },
-      body: JSON.stringify({
-        action: "sign-in",
-        email
-      })
-    });
-
-    const json = (await response.json()) as { error?: string };
-
-    if (!response.ok) {
-      setError(json.error || "Unable to sign in.");
-      setLoading(false);
-      return;
-    }
-
-    router.push("/dashboard");
-  }
-
+export default function HomePage() {
   return (
-    <main className="relative overflow-hidden">
-      <div className="absolute -left-40 top-0 h-96 w-96 rounded-full bg-[#2f81f7]/20 blur-3xl" />
-      <div className="absolute -right-40 top-24 h-[420px] w-[420px] rounded-full bg-[#3fb950]/10 blur-3xl" />
-
-      <section className="mx-auto flex w-full max-w-6xl flex-col gap-12 px-6 pb-20 pt-10 sm:px-8 lg:px-10">
-        <header className="flex items-center justify-between">
-          <Link href="/" className="text-sm font-semibold tracking-wide text-[#9da7b3]">
+    <main className="grid-glow min-h-screen">
+      <section className="mx-auto flex w-full max-w-6xl flex-col gap-10 px-6 pb-14 pt-10 md:pt-16">
+        <header className="flex items-center justify-between gap-6">
+          <div className="flex items-center gap-2 text-sm font-medium text-slate-300">
+            <ShieldAlert className="h-4 w-4 text-sky-400" />
             Claude Usage Cap
-          </Link>
-          <Link href="/dashboard" className="text-sm font-medium text-[#9da7b3] hover:text-[#e6edf3]">
-            Dashboard
-          </Link>
+          </div>
+          <nav className="flex items-center gap-3">
+            <Link href="/unlock" className="text-sm text-slate-300 hover:text-white">
+              Unlock Access
+            </Link>
+            <Button asChild variant="outline" size="sm">
+              <a href={paymentLink} target="_blank" rel="noreferrer">
+                Buy $15/mo
+              </a>
+            </Button>
+          </nav>
         </header>
 
-        <div className="grid gap-10 lg:grid-cols-[1.2fr_0.8fr] lg:items-center">
+        <div className="grid gap-8 lg:grid-cols-[1.25fr_0.75fr] lg:items-end">
           <div className="space-y-6">
-            <p className="inline-flex items-center gap-2 rounded-full border border-[#30363d] bg-[#111821] px-4 py-1 text-xs font-semibold uppercase tracking-[0.12em] text-[#9da7b3]">
-              <ShieldAlert size={14} />
-              Hard cost guardrails for Anthropic workloads
+            <p className="inline-flex rounded-full border border-slate-700 bg-slate-900/70 px-3 py-1 text-xs font-semibold tracking-wide text-sky-300">
+              AI Cost Guardrails for Builders
             </p>
-            <h1 className="text-4xl font-semibold leading-tight tracking-tight sm:text-5xl">
-              Claude Usage Cap
-              <span className="mt-2 block text-2xl text-[#9da7b3] sm:text-3xl">
-                Per-project spend limits on the Claude API with auto-cutoff
-              </span>
+            <h1 className="max-w-3xl text-4xl font-bold tracking-tight text-white md:text-6xl">
+              Hard spend limits for Claude API projects, with automatic cutoff the second you cross budget.
             </h1>
-            <p className="max-w-2xl text-lg text-[#c3ccd5]">
-              Stop runaway AI bills before they happen. Add your Anthropic key, generate a project proxy key,
-              set daily, weekly, and monthly USD caps, and instantly block requests once limits are reached.
+            <p className="max-w-2xl text-lg text-slate-300">
+              Anthropic does not offer per-key budget caps. One failed loop can burn hundreds overnight. Claude Usage Cap gives each project a dedicated proxy key with daily, weekly, and monthly limits plus Slack alerts when blocking starts.
             </p>
-            <div className="grid gap-3 text-sm text-[#9da7b3] sm:grid-cols-2">
-              <p className="rounded-lg border border-[#30363d] bg-[#111821]/60 p-3">
-                Dev bug protection: a looping queue cannot drain your card overnight.
-              </p>
-              <p className="rounded-lg border border-[#30363d] bg-[#111821]/60 p-3">
-                SaaS safety: isolate spend limits by project, environment, or customer workload.
-              </p>
+            <div className="flex flex-wrap items-center gap-3">
+              <Button asChild size="lg">
+                <a href={paymentLink} target="_blank" rel="noreferrer">
+                  Start Protection for $15/mo
+                </a>
+              </Button>
+              <Button asChild variant="outline" size="lg">
+                <Link href="/unlock">Already Paid? Unlock Dashboard</Link>
+              </Button>
             </div>
           </div>
+          <Card className="border-sky-500/20 bg-slate-900/85">
+            <CardHeader>
+              <CardTitle className="text-xl text-white">What you get</CardTitle>
+              <CardDescription>Purpose-built for dev workloads and SaaS products using Claude.</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <Feature icon={BarChart3} title="Real-time usage ledger" text="Track spend per request using model-aware token pricing." />
+              <Feature icon={Bolt} title="Instant 429 cutoff" text="Proxy blocks new calls the moment a cap window is exhausted." />
+              <Feature icon={Slack} title="Slack incident alert" text="Notify your team when a project is being blocked by budget rules." />
+            </CardContent>
+          </Card>
+        </div>
+      </section>
 
-          <div className="rounded-xl border border-[#30363d] bg-[#111821]/80 p-6">
-            <h2 className="text-xl font-semibold">Start protecting your first project</h2>
-            <p className="mt-2 text-sm text-[#9da7b3]">
-              Sign in with your work email. After checkout, your dashboard unlocks project-level caps and proxy keys.
-            </p>
+      <section className="mx-auto grid w-full max-w-6xl gap-5 px-6 pb-14 md:grid-cols-3">
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-white">
+              <AlertTriangle className="h-5 w-5 text-amber-300" />
+              Problem
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="text-sm text-slate-300">
+            Teams ship experiments quickly, and a single infinite retry loop can consume large API spend before anyone notices.
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-white">
+              <ShieldAlert className="h-5 w-5 text-sky-400" />
+              Solution
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="text-sm text-slate-300">
+            Route traffic through a project proxy key that enforces budget caps before forwarding to Claude.
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-white">
+              <CheckCircle2 className="h-5 w-5 text-emerald-300" />
+              Outcome
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="text-sm text-slate-300">
+            Experimental workloads stay inside predefined spend boundaries without manual monitoring.
+          </CardContent>
+        </Card>
+      </section>
 
-            <form className="mt-6 space-y-4" onSubmit={signIn}>
-              <div className="space-y-2">
-                <Label htmlFor="email">Work email</Label>
-                <Input
-                  id="email"
-                  type="email"
-                  value={email}
-                  onChange={(event) => setEmail(event.target.value)}
-                  placeholder="you@company.com"
-                  required
-                />
-              </div>
-              <Button type="submit" className="w-full" disabled={loading}>
-                {loading ? "Signing in..." : "Open dashboard"}
+      <section id="pricing" className="mx-auto w-full max-w-4xl px-6 pb-14">
+        <Card className="border-sky-500/25 bg-slate-900/90">
+          <CardHeader>
+            <CardTitle className="text-3xl text-white">Simple pricing</CardTitle>
+            <CardDescription>One flat subscription per protected project.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-5">
+            <p className="text-5xl font-bold text-sky-300">$15<span className="text-xl text-slate-400">/project/month</span></p>
+            <ul className="grid gap-3 text-sm text-slate-200">
+              <li className="flex items-start gap-2"><CheckCircle2 className="mt-0.5 h-4 w-4 text-emerald-300" />Daily, weekly, and monthly cap enforcement</li>
+              <li className="flex items-start gap-2"><CheckCircle2 className="mt-0.5 h-4 w-4 text-emerald-300" />Per-project proxy key issuance and rotation support</li>
+              <li className="flex items-start gap-2"><CheckCircle2 className="mt-0.5 h-4 w-4 text-emerald-300" />Slack alert on blocked requests</li>
+              <li className="flex items-start gap-2"><CheckCircle2 className="mt-0.5 h-4 w-4 text-emerald-300" />Usage dashboard and 30-day spend chart</li>
+            </ul>
+            <div className="flex flex-wrap gap-3">
+              <Button asChild size="lg">
+                <a href={paymentLink} target="_blank" rel="noreferrer">
+                  Buy Protection
+                </a>
               </Button>
-              {error ? <p className="text-sm text-[#f85149]">{error}</p> : null}
-            </form>
-
-            {session?.authenticated && checkoutUrl ? (
-              <a
-                href={checkoutUrl}
-                className="lemonsqueezy-button mt-3 inline-flex h-10 w-full items-center justify-center rounded-md border border-[#3fb950] bg-[#238636] px-4 text-sm font-semibold text-[#f0f6fc] hover:bg-[#2ea043]"
-              >
-                Activate paid access ($15/mo)
-              </a>
-            ) : null}
-          </div>
-        </div>
+              <Button asChild variant="outline" size="lg">
+                <Link href="/unlock">Use Existing Subscription</Link>
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
       </section>
 
-      <section className="border-y border-[#30363d] bg-[#0f1520]/70">
-        <div className="mx-auto grid w-full max-w-6xl gap-6 px-6 py-12 sm:px-8 lg:grid-cols-3 lg:px-10">
-          <article className="rounded-xl border border-[#30363d] bg-[#111821]/70 p-5">
-            <AlertTriangle className="mb-4 text-[#f0883e]" />
-            <h3 className="text-lg font-semibold">Problem: silent runaway spend</h3>
-            <p className="mt-2 text-sm text-[#9da7b3]">
-              Anthropic keys don&apos;t support hard budget caps. One retry loop or background worker bug can create
-              thousands of expensive completions before anyone notices.
-            </p>
-          </article>
-
-          <article className="rounded-xl border border-[#30363d] bg-[#111821]/70 p-5">
-            <Lock className="mb-4 text-[#2f81f7]" />
-            <h3 className="text-lg font-semibold">Solution: enforceable proxy caps</h3>
-            <p className="mt-2 text-sm text-[#9da7b3]">
-              Every request goes through your proxy key. Usage is tracked per project and immediately blocked with HTTP
-              429 when daily, weekly, or monthly limits are reached.
-            </p>
-          </article>
-
-          <article className="rounded-xl border border-[#30363d] bg-[#111821]/70 p-5">
-            <Slack className="mb-4 text-[#3fb950]" />
-            <h3 className="text-lg font-semibold">Outcome: rapid team response</h3>
-            <p className="mt-2 text-sm text-[#9da7b3]">
-              Receive Slack alerts as soon as a cap is hit. Engineering knows exactly which project was blocked and can
-              fix the issue without discovering the problem from an invoice.
-            </p>
-          </article>
-        </div>
-      </section>
-
-      <section className="mx-auto w-full max-w-6xl px-6 py-14 sm:px-8 lg:px-10">
-        <div className="grid gap-6 lg:grid-cols-3">
-          <article className="rounded-xl border border-[#30363d] bg-[#111821]/60 p-5">
-            <Zap className="mb-4 text-[#f0883e]" />
-            <h3 className="text-lg font-semibold">Deploy in minutes</h3>
-            <p className="mt-2 text-sm text-[#9da7b3]">
-              Swap your Claude endpoint to a single proxy URL and attach `x-proxy-key`. No SDK rewrite required.
-            </p>
-          </article>
-          <article className="rounded-xl border border-[#30363d] bg-[#111821]/60 p-5">
-            <LineChart className="mb-4 text-[#2f81f7]" />
-            <h3 className="text-lg font-semibold">See spend trends</h3>
-            <p className="mt-2 text-sm text-[#9da7b3]">
-              Review rolling 30-day usage charts, current period totals, and exact cap utilization per project.
-            </p>
-          </article>
-          <article className="rounded-xl border border-[#30363d] bg-[#111821]/60 p-5">
-            <ShieldAlert className="mb-4 text-[#3fb950]" />
-            <h3 className="text-lg font-semibold">Insurance at startup scale</h3>
-            <p className="mt-2 text-sm text-[#9da7b3]">
-              Pay $15/month per project instead of gambling against a $500 overnight billing mistake.
-            </p>
-          </article>
-        </div>
-      </section>
-
-      <section className="mx-auto w-full max-w-6xl px-6 pb-14 sm:px-8 lg:px-10">
-        <div className="rounded-2xl border border-[#3fb950] bg-[#111f16]/50 p-8">
-          <p className="text-sm uppercase tracking-[0.12em] text-[#7ee787]">Simple pricing</p>
-          <h2 className="mt-2 text-3xl font-semibold">$15 / month / project</h2>
-          <p className="mt-3 max-w-2xl text-[#c3ccd5]">
-            Includes unlimited proxy requests, per-project cap enforcement, 30-day usage charting, and Slack limit
-            alerts. Add projects as you scale. Cancel anytime.
-          </p>
-          <div className="mt-6 flex flex-wrap gap-3">
-            <Button onClick={() => router.push("/dashboard")}>Open dashboard</Button>
-            {checkoutUrl ? (
-              <a
-                href={checkoutUrl}
-                className="lemonsqueezy-button inline-flex h-10 items-center justify-center rounded-md border border-[#3fb950] bg-[#238636] px-4 text-sm font-semibold text-[#f0f6fc] hover:bg-[#2ea043]"
-              >
-                Start paid access
-              </a>
-            ) : null}
-          </div>
-        </div>
-      </section>
-
-      <section className="mx-auto w-full max-w-6xl px-6 pb-20 sm:px-8 lg:px-10">
-        <h2 className="text-2xl font-semibold">FAQ</h2>
-        <div className="mt-6 grid gap-4">
-          {faq.map((item) => (
-            <article key={item.question} className="rounded-xl border border-[#30363d] bg-[#111821]/70 p-5">
-              <h3 className="text-base font-semibold">{item.question}</h3>
-              <p className="mt-2 text-sm leading-relaxed text-[#9da7b3]">{item.answer}</p>
-            </article>
+      <section className="mx-auto w-full max-w-5xl px-6 pb-20">
+        <h2 className="mb-6 text-2xl font-semibold text-white">FAQ</h2>
+        <div className="grid gap-4 md:grid-cols-2">
+          {faqs.map((faq) => (
+            <Card key={faq.q}>
+              <CardHeader>
+                <CardTitle className="text-base text-white">{faq.q}</CardTitle>
+              </CardHeader>
+              <CardContent className="text-sm text-slate-300">{faq.a}</CardContent>
+            </Card>
           ))}
         </div>
       </section>
     </main>
+  );
+}
+
+function Feature({
+  icon: Icon,
+  title,
+  text
+}: {
+  icon: ComponentType<{ className?: string }>;
+  title: string;
+  text: string;
+}) {
+  return (
+    <div className="rounded-lg border border-slate-800 bg-slate-950/60 p-4">
+      <div className="mb-2 flex items-center gap-2 text-sm font-semibold text-slate-100">
+        <Icon className="h-4 w-4 text-sky-300" />
+        {title}
+      </div>
+      <p className="text-sm text-slate-400">{text}</p>
+    </div>
   );
 }

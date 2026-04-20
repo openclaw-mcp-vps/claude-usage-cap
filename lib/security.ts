@@ -1,54 +1,79 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 
-const KEY_BYTES = 32;
-
-function deriveKey(): Buffer {
-  const source = process.env.SECRET_ENCRYPTION_KEY || "dev-insecure-encryption-key-change-me";
-  return createHash("sha256").update(source).digest().subarray(0, KEY_BYTES);
+function appSecret() {
+  return process.env.APP_SECRET || process.env.STRIPE_WEBHOOK_SECRET || "development-secret-change-me";
 }
 
-export function hashSecret(secret: string): string {
-  return createHash("sha256").update(secret).digest("hex");
+export function generateProxyKey() {
+  return randomBytes(24).toString("base64url");
 }
 
-export function secureEqual(a: string, b: string): boolean {
-  const aBuf = Buffer.from(a);
-  const bBuf = Buffer.from(b);
+export function hashProxyKey(proxyKey: string) {
+  return createHmac("sha256", appSecret()).update(proxyKey).digest("hex");
+}
 
-  if (aBuf.length !== bBuf.length) {
+function encryptionKey() {
+  return scryptSync(appSecret(), "claude-usage-cap", 32);
+}
+
+export function encryptSecret(plaintext: string) {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", encryptionKey(), iv);
+  const ciphertext = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+
+  return `enc:v1:${iv.toString("base64url")}:${tag.toString("base64url")}:${ciphertext.toString("base64url")}`;
+}
+
+export function decryptSecret(value: string) {
+  if (!value.startsWith("enc:v1:")) {
+    return value;
+  }
+
+  const parts = value.split(":");
+  if (parts.length !== 5) {
+    throw new Error("Invalid encrypted secret format");
+  }
+
+  const iv = Buffer.from(parts[2], "base64url");
+  const tag = Buffer.from(parts[3], "base64url");
+  const ciphertext = Buffer.from(parts[4], "base64url");
+
+  const decipher = createDecipheriv("aes-256-gcm", encryptionKey(), iv);
+  decipher.setAuthTag(tag);
+  const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+
+  return decrypted.toString("utf8");
+}
+
+export function verifyStripeSignature(payload: string, signatureHeader: string | null, secret: string) {
+  if (!signatureHeader) {
     return false;
   }
 
-  return timingSafeEqual(aBuf, bBuf);
-}
+  const parts = signatureHeader.split(",").map((part) => part.trim());
+  const timestampPart = parts.find((part) => part.startsWith("t="));
+  const signatures = parts
+    .filter((part) => part.startsWith("v1="))
+    .map((part) => part.slice(3));
 
-export function generateOpaqueKey(prefix: string): string {
-  const token = randomBytes(24).toString("base64url");
-  return `${prefix}${token}`;
-}
+  if (!timestampPart || signatures.length === 0) {
+    return false;
+  }
 
-export function encryptSecret(raw: string): string {
-  const iv = randomBytes(12);
-  const key = deriveKey();
-  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  const timestamp = timestampPart.slice(2);
+  const signedPayload = `${timestamp}.${payload}`;
+  const expected = createHmac("sha256", secret).update(signedPayload).digest("hex");
 
-  const encrypted = Buffer.concat([cipher.update(raw, "utf8"), cipher.final()]);
-  const tag = cipher.getAuthTag();
+  for (const signature of signatures) {
+    if (signature.length !== expected.length) {
+      continue;
+    }
 
-  return Buffer.concat([iv, tag, encrypted]).toString("base64");
-}
+    if (timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) {
+      return true;
+    }
+  }
 
-export function decryptSecret(encrypted: string): string {
-  const buffer = Buffer.from(encrypted, "base64");
-
-  const iv = buffer.subarray(0, 12);
-  const tag = buffer.subarray(12, 28);
-  const payload = buffer.subarray(28);
-  const key = deriveKey();
-
-  const decipher = createDecipheriv("aes-256-gcm", key, iv);
-  decipher.setAuthTag(tag);
-
-  const decrypted = Buffer.concat([decipher.update(payload), decipher.final()]);
-  return decrypted.toString("utf8");
+  return false;
 }

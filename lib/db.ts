@@ -1,122 +1,292 @@
-import { Pool } from "pg";
+import { mkdirSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
 
-declare global {
-  // eslint-disable-next-line no-var
-  var __clawPool: Pool | undefined;
-  // eslint-disable-next-line no-var
-  var __clawSchemaInit: Promise<void> | undefined;
+import Database from "better-sqlite3";
+
+import { encryptSecret, generateProxyKey, hashProxyKey } from "@/lib/security";
+
+export type ProjectRecord = {
+  id: string;
+  name: string;
+  proxyKeyHash: string;
+  proxyKeyHint: string;
+  anthropicApiKey: string;
+  dailyCap: number;
+  weeklyCap: number;
+  monthlyCap: number;
+  slackBotToken: string | null;
+  slackChannel: string | null;
+  isActive: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type UsageEventInsert = {
+  projectId: string;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
+  costUsd: number;
+};
+
+let dbInstance: Database.Database | null = null;
+
+function getDbPath() {
+  return resolve(process.cwd(), process.env.DATABASE_PATH || ".data/claude-usage-cap.db");
 }
 
-function getPool(): Pool {
-  const connectionString = process.env.DATABASE_URL;
+function initDb() {
+  const dbPath = getDbPath();
+  mkdirSync(dirname(dbPath), { recursive: true });
 
-  if (!connectionString) {
-    throw new Error(
-      "DATABASE_URL is required. Provision Postgres and set DATABASE_URL to enable Claude Usage Cap."
-    );
-  }
+  const db = new Database(dbPath);
+  db.pragma("journal_mode = WAL");
 
-  if (!global.__clawPool) {
-    const useSsl =
-      !connectionString.includes("localhost") &&
-      !connectionString.includes("127.0.0.1") &&
-      !connectionString.includes("sslmode=disable");
-
-    global.__clawPool = new Pool({
-      connectionString,
-      max: 10,
-      ssl: useSsl ? { rejectUnauthorized: false } : undefined
-    });
-  }
-
-  return global.__clawPool;
-}
-
-async function initSchema(): Promise<void> {
-  const pool = getPool();
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS subscriptions (
-      email TEXT PRIMARY KEY,
-      status TEXT NOT NULL,
-      customer_id TEXT,
-      subscription_id TEXT,
-      order_id TEXT,
-      current_period_end TIMESTAMPTZ,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
+  db.exec(`
     CREATE TABLE IF NOT EXISTS projects (
       id TEXT PRIMARY KEY,
-      owner_email TEXT NOT NULL,
       name TEXT NOT NULL,
-      anthropic_key_encrypted TEXT NOT NULL,
-      proxy_key_hash TEXT UNIQUE NOT NULL,
-      proxy_key_last4 TEXT NOT NULL,
-      slack_webhook_url TEXT,
-      daily_cap_usd NUMERIC(12, 2) NOT NULL,
-      weekly_cap_usd NUMERIC(12, 2) NOT NULL,
-      monthly_cap_usd NUMERIC(12, 2) NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      proxy_key_hash TEXT NOT NULL UNIQUE,
+      proxy_key_hint TEXT NOT NULL,
+      anthropic_api_key TEXT NOT NULL,
+      daily_cap REAL NOT NULL,
+      weekly_cap REAL NOT NULL,
+      monthly_cap REAL NOT NULL,
+      slack_bot_token TEXT,
+      slack_channel TEXT,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
     );
-
-    CREATE INDEX IF NOT EXISTS idx_projects_owner_email ON projects(owner_email);
 
     CREATE TABLE IF NOT EXISTS usage_events (
-      id BIGSERIAL PRIMARY KEY,
+      id TEXT PRIMARY KEY,
       project_id TEXT NOT NULL,
       model TEXT NOT NULL,
-      input_tokens INTEGER NOT NULL DEFAULT 0,
-      output_tokens INTEGER NOT NULL DEFAULT 0,
-      cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
-      cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-      cost_usd NUMERIC(14, 6) NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      CONSTRAINT fk_usage_project FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+      input_tokens INTEGER NOT NULL,
+      output_tokens INTEGER NOT NULL,
+      cache_creation_tokens INTEGER NOT NULL,
+      cache_read_tokens INTEGER NOT NULL,
+      cost_usd REAL NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(project_id) REFERENCES projects(id)
     );
 
-    CREATE INDEX IF NOT EXISTS idx_usage_events_project_created_at ON usage_events(project_id, created_at);
-
-    CREATE TABLE IF NOT EXISTS alert_events (
-      id BIGSERIAL PRIMARY KEY,
+    CREATE TABLE IF NOT EXISTS alerts (
+      id TEXT PRIMARY KEY,
       project_id TEXT NOT NULL,
-      window_type TEXT NOT NULL,
-      window_start TIMESTAMPTZ NOT NULL,
-      sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      CONSTRAINT fk_alert_project FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
-      CONSTRAINT uniq_alert_window UNIQUE(project_id, window_type, window_start)
+      period TEXT NOT NULL,
+      period_start TEXT NOT NULL,
+      sent_at TEXT NOT NULL,
+      UNIQUE(project_id, period, period_start),
+      FOREIGN KEY(project_id) REFERENCES projects(id)
     );
 
-    CREATE TABLE IF NOT EXISTS processed_webhooks (
-      event_key TEXT PRIMARY KEY,
-      processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    CREATE TABLE IF NOT EXISTS purchases (
+      id TEXT PRIMARY KEY,
+      email TEXT NOT NULL UNIQUE,
+      source TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      last_paid_at TEXT NOT NULL
     );
   `);
+
+  return db;
 }
 
-export async function ensureSchema(): Promise<void> {
-  if (!global.__clawSchemaInit) {
-    global.__clawSchemaInit = initSchema();
+function db() {
+  if (!dbInstance) {
+    dbInstance = initDb();
   }
 
-  await global.__clawSchemaInit;
+  return dbInstance;
 }
 
-export async function sql<T = Record<string, unknown>>(
-  query: string,
-  values: unknown[] = []
-): Promise<T[]> {
-  await ensureSchema();
-  const pool = getPool();
-  const result = await pool.query(query, values);
-  return result.rows as T[];
+const projectSelectColumns = `
+  id,
+  name,
+  proxy_key_hash as proxyKeyHash,
+  proxy_key_hint as proxyKeyHint,
+  anthropic_api_key as anthropicApiKey,
+  daily_cap as dailyCap,
+  weekly_cap as weeklyCap,
+  monthly_cap as monthlyCap,
+  slack_bot_token as slackBotToken,
+  slack_channel as slackChannel,
+  is_active as isActive,
+  created_at as createdAt,
+  updated_at as updatedAt
+`;
+
+export function listProjects() {
+  return db()
+    .prepare(`SELECT ${projectSelectColumns} FROM projects WHERE is_active = 1 ORDER BY created_at DESC`)
+    .all() as ProjectRecord[];
 }
 
-export async function sqlOne<T = Record<string, unknown>>(
-  query: string,
-  values: unknown[] = []
-): Promise<T | null> {
-  const rows = await sql<T>(query, values);
-  return rows[0] ?? null;
+export function getProjectById(projectId: string) {
+  return db()
+    .prepare(`SELECT ${projectSelectColumns} FROM projects WHERE id = ? AND is_active = 1`)
+    .get(projectId) as ProjectRecord | undefined;
+}
+
+export function getProjectByProxyKey(proxyKey: string) {
+  const proxyKeyHash = hashProxyKey(proxyKey);
+  return db()
+    .prepare(`SELECT ${projectSelectColumns} FROM projects WHERE proxy_key_hash = ? AND is_active = 1`)
+    .get(proxyKeyHash) as ProjectRecord | undefined;
+}
+
+export function createProject(input: {
+  name: string;
+  anthropicApiKey: string;
+  dailyCap: number;
+  weeklyCap: number;
+  monthlyCap: number;
+  slackBotToken?: string;
+  slackChannel?: string;
+}) {
+  const now = new Date().toISOString();
+  const id = randomUUID();
+  const proxyKey = generateProxyKey();
+  const proxyKeyHash = hashProxyKey(proxyKey);
+  const proxyKeyHint = proxyKey.slice(-6);
+
+  db()
+    .prepare(
+      `INSERT INTO projects (
+        id,
+        name,
+        proxy_key_hash,
+        proxy_key_hint,
+        anthropic_api_key,
+        daily_cap,
+        weekly_cap,
+        monthly_cap,
+        slack_bot_token,
+        slack_channel,
+        is_active,
+        created_at,
+        updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
+    )
+    .run(
+      id,
+      input.name,
+      proxyKeyHash,
+      proxyKeyHint,
+      encryptSecret(input.anthropicApiKey),
+      input.dailyCap,
+      input.weeklyCap,
+      input.monthlyCap,
+      input.slackBotToken || null,
+      input.slackChannel || null,
+      now,
+      now
+    );
+
+  const project = getProjectById(id);
+
+  if (!project) {
+    throw new Error("Failed to create project");
+  }
+
+  return {
+    project,
+    proxyKey
+  };
+}
+
+export function recordUsageEvent(event: UsageEventInsert) {
+  const now = new Date().toISOString();
+
+  db()
+    .prepare(
+      `INSERT INTO usage_events (
+        id,
+        project_id,
+        model,
+        input_tokens,
+        output_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+        cost_usd,
+        created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      randomUUID(),
+      event.projectId,
+      event.model,
+      event.inputTokens,
+      event.outputTokens,
+      event.cacheCreationTokens,
+      event.cacheReadTokens,
+      event.costUsd,
+      now
+    );
+}
+
+export function getSpendSince(projectId: string, sinceIso: string) {
+  const row = db()
+    .prepare(
+      `SELECT COALESCE(SUM(cost_usd), 0) as spend
+       FROM usage_events
+       WHERE project_id = ? AND created_at >= ?`
+    )
+    .get(projectId, sinceIso) as { spend: number };
+
+  return row.spend || 0;
+}
+
+export function getUsageSeries(projectId: string, sinceIso: string) {
+  return db()
+    .prepare(
+      `SELECT substr(created_at, 1, 10) as date, COALESCE(SUM(cost_usd), 0) as spend
+       FROM usage_events
+       WHERE project_id = ? AND created_at >= ?
+       GROUP BY substr(created_at, 1, 10)
+       ORDER BY date ASC`
+    )
+    .all(projectId, sinceIso) as Array<{ date: string; spend: number }>;
+}
+
+export function markAlertSent(projectId: string, period: string, periodStart: string) {
+  const now = new Date().toISOString();
+
+  const result = db()
+    .prepare(
+      `INSERT OR IGNORE INTO alerts (id, project_id, period, period_start, sent_at)
+       VALUES (?, ?, ?, ?, ?)`
+    )
+    .run(randomUUID(), projectId, period, periodStart, now);
+
+  return result.changes > 0;
+}
+
+export function upsertPurchase(email: string, source: string) {
+  const normalizedEmail = email.trim().toLowerCase();
+  const now = new Date().toISOString();
+
+  db()
+    .prepare(
+      `INSERT INTO purchases (id, email, source, created_at, last_paid_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(email)
+       DO UPDATE SET source = excluded.source, last_paid_at = excluded.last_paid_at`
+    )
+    .run(randomUUID(), normalizedEmail, source, now, now);
+}
+
+export function hasPurchaseForEmail(email: string) {
+  const normalizedEmail = email.trim().toLowerCase();
+
+  const row = db()
+    .prepare(`SELECT email FROM purchases WHERE email = ?`)
+    .get(normalizedEmail) as { email: string } | undefined;
+
+  return Boolean(row);
 }

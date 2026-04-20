@@ -1,85 +1,71 @@
-import { NextRequest, NextResponse } from "next/server";
+import { cookies } from "next/headers";
 import { z } from "zod";
 
-import { attachSession, clearSession, getOrCreateUser, getUserFromRequest, isUserPaid } from "@/lib/auth";
-import { buildCheckoutUrl } from "@/lib/lemonsqueezy";
+import { hasPurchaseForEmail } from "@/lib/db";
+import { createSessionToken, SESSION_COOKIE, verifySessionToken } from "@/lib/session";
 
-const signInSchema = z.object({
-  action: z.literal("sign-in"),
-  email: z.string().trim().email()
+const loginSchema = z.object({
+  email: z.string().email()
 });
 
-const signOutSchema = z.object({
-  action: z.literal("sign-out")
-});
+export const runtime = "nodejs";
 
-const actionSchema = z.union([signInSchema, signOutSchema]);
+export async function GET() {
+  const cookieStore = await cookies();
+  const token = cookieStore.get(SESSION_COOKIE)?.value;
 
-export async function GET(request: NextRequest) {
-  const user = await getUserFromRequest(request);
-
-  if (!user) {
-    return NextResponse.json({
-      authenticated: false,
-      user: null,
-      checkoutUrl: null
-    });
+  if (!token) {
+    return Response.json({ authenticated: false });
   }
 
-  return NextResponse.json({
-    authenticated: true,
-    user: {
-      id: user.id,
-      email: user.email,
-      paidUntil: user.paidUntil,
-      subscriptionStatus: user.subscriptionStatus,
-      isPaid: isUserPaid(user)
-    },
-    checkoutUrl: buildCheckoutUrl({
-      userId: user.id,
-      email: user.email
-    })
+  const payload = await verifySessionToken(token);
+
+  return Response.json({
+    authenticated: Boolean(payload?.email),
+    email: payload?.email ?? null
   });
 }
 
-export async function POST(request: NextRequest) {
-  let body: unknown;
-
-  try {
-    body = await request.json();
-  } catch {
-    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
-  }
-
-  const parsed = actionSchema.safeParse(body);
+export async function POST(request: Request) {
+  const payload = await request.json().catch(() => null);
+  const parsed = loginSchema.safeParse(payload);
 
   if (!parsed.success) {
-    return NextResponse.json({ error: "Invalid auth payload." }, { status: 400 });
+    return Response.json({ error: "Please provide a valid email." }, { status: 400 });
   }
 
-  if (parsed.data.action === "sign-out") {
-    const response = NextResponse.json({ ok: true });
-    clearSession(response);
-    return response;
+  const email = parsed.data.email.trim().toLowerCase();
+  const purchased = hasPurchaseForEmail(email);
+
+  if (!purchased) {
+    return Response.json(
+      {
+        error:
+          "No paid subscription was found for this email. Complete checkout first, then retry unlock with the same email."
+      },
+      { status: 403 }
+    );
   }
 
-  const user = await getOrCreateUser(parsed.data.email);
+  const token = await createSessionToken(email);
+  const cookieStore = await cookies();
 
-  const response = NextResponse.json({
-    ok: true,
-    user: {
-      id: user.id,
-      email: user.email,
-      paidUntil: user.paidUntil,
-      subscriptionStatus: user.subscriptionStatus,
-      isPaid: isUserPaid(user)
-    },
-    checkoutUrl: buildCheckoutUrl({
-      userId: user.id,
-      email: user.email
-    })
+  cookieStore.set({
+    name: SESSION_COOKIE,
+    value: token,
+    httpOnly: true,
+    sameSite: "lax",
+    secure: process.env.NODE_ENV === "production",
+    path: "/",
+    maxAge: 60 * 60 * 24 * 30
   });
 
-  await attachSession(response, user);
-  return response;
+  return Response.json({ ok: true });
+}
+
+export async function DELETE() {
+  const cookieStore = await cookies();
+  cookieStore.delete(SESSION_COOKIE);
+
+  return Response.json({ ok: true });
 }

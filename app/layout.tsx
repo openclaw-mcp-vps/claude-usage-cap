@@ -1,21 +1,29 @@
 import type { Metadata } from "next";
-import Script from "next/script";
+import { IBM_Plex_Mono, Space_Grotesk } from "next/font/google";
 
-import "@/app/globals.css";
+import "./globals.css";
+
+const spaceGrotesk = Space_Grotesk({
+  subsets: ["latin"],
+  variable: "--font-space-grotesk"
+});
+
+const ibmPlexMono = IBM_Plex_Mono({
+  subsets: ["latin"],
+  variable: "--font-ibm-plex-mono",
+  weight: ["400", "500", "600"]
+});
 
 export const metadata: Metadata = {
-  metadataBase: new URL(process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000"),
-  title: {
-    default: "Claude Usage Cap",
-    template: "%s | Claude Usage Cap"
-  },
+  metadataBase: new URL("https://claude-usage-cap.example.com"),
+  title: "Claude Usage Cap | Per-Project Spend Limits for Claude API",
   description:
-    "Set per-project spend limits for Anthropic Claude API usage. Get a proxy key with daily, weekly, and monthly caps plus instant Slack alerts when limits are hit.",
+    "Protect Claude API projects with hard daily, weekly, and monthly spend caps, proxy keys, and Slack cutoff alerts.",
   openGraph: {
     title: "Claude Usage Cap",
     description:
-      "Per-project spend limits on the Claude API with auto-cutoff and Slack alerts to stop runaway costs.",
-    url: "/",
+      "Per-project Claude API spend limits with automatic 429 cutoff and Slack alerts to prevent runaway bills.",
+    url: "https://claude-usage-cap.example.com",
     siteName: "Claude Usage Cap",
     type: "website"
   },
@@ -23,17 +31,21 @@ export const metadata: Metadata = {
     card: "summary_large_image",
     title: "Claude Usage Cap",
     description:
-      "Stop runaway Anthropic spend. Enforce hard daily, weekly, and monthly caps on every project."
-  }
+      "Put hard budget caps in front of Claude API usage. Stop accidental overnight spend from bad loops and experiments."
+  },
+  keywords: [
+    "Anthropic budget cap",
+    "Claude API proxy",
+    "LLM cost control",
+    "AI spend limits",
+    "SaaS founder tooling"
+  ]
 };
 
-export default function RootLayout({ children }: { children: React.ReactNode }) {
+export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="en" className="dark">
-      <body className="min-h-screen bg-[#0d1117] text-[#e6edf3] antialiased">
-        <Script src="https://app.lemonsqueezy.com/js/lemon.js" strategy="afterInteractive" />
-        {children}
-      </body>
+    <html lang="en" className={`${spaceGrotesk.variable} ${ibmPlexMono.variable}`}>
+      <body>{children}</body>
     </html>
   );
 }

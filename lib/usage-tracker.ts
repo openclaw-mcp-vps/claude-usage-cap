@@ -1,196 +1,169 @@
-import { randomUUID } from "node:crypto";
+import { getSpendSince, getUsageSeries, recordUsageEvent } from "@/lib/db";
 
-import { addAlertLog, addUsageEvent, listAlertLogs, listUsageEvents } from "@/lib/storage";
-import type { BillingCaps, Project, UsageEvent } from "@/lib/types";
+export type CapPeriod = "daily" | "weekly" | "monthly";
 
 const MODEL_PRICING_PER_MILLION: Record<
   string,
-  {
-    input: number;
-    output: number;
-  }
+  { input: number; output: number; cacheCreation: number; cacheRead: number }
 > = {
-  "claude-3-5-haiku-latest": { input: 0.8, output: 4 },
-  "claude-3-5-sonnet-latest": { input: 3, output: 15 },
-  "claude-3-7-sonnet-latest": { input: 3, output: 15 },
-  "claude-sonnet-4-0": { input: 3, output: 15 },
-  "claude-opus-4-0": { input: 15, output: 75 }
+  "claude-3-opus-latest": { input: 15, output: 75, cacheCreation: 18.75, cacheRead: 1.5 },
+  "claude-3-5-sonnet-latest": { input: 3, output: 15, cacheCreation: 3.75, cacheRead: 0.3 },
+  "claude-3-7-sonnet-latest": { input: 3, output: 15, cacheCreation: 3.75, cacheRead: 0.3 },
+  "claude-3-5-haiku-latest": { input: 0.8, output: 4, cacheCreation: 1, cacheRead: 0.08 },
+  "claude-sonnet-4-0": { input: 3, output: 15, cacheCreation: 3.75, cacheRead: 0.3 },
+  "claude-haiku-4-0": { input: 0.8, output: 4, cacheCreation: 1, cacheRead: 0.08 }
 };
 
-const DEFAULT_PRICING = { input: 3, output: 15 };
-
-export function normalizeModelName(model: string): string {
-  return model.trim().toLowerCase();
+function pricingForModel(model: string) {
+  return MODEL_PRICING_PER_MILLION[model] || MODEL_PRICING_PER_MILLION["claude-3-7-sonnet-latest"];
 }
 
-export function calculateCostUsd(model: string, inputTokens: number, outputTokens: number): number {
-  const pricing = MODEL_PRICING_PER_MILLION[normalizeModelName(model)] ?? DEFAULT_PRICING;
-  const inputCost = (Math.max(0, inputTokens) / 1_000_000) * pricing.input;
-  const outputCost = (Math.max(0, outputTokens) / 1_000_000) * pricing.output;
-
-  return Number((inputCost + outputCost).toFixed(6));
-}
-
-export function periodStart(period: "daily" | "weekly" | "monthly", date = new Date()): Date {
-  const value = new Date(date);
-
-  if (period === "daily") {
-    value.setUTCHours(0, 0, 0, 0);
-    return value;
-  }
-
-  if (period === "weekly") {
-    const day = value.getUTCDay();
-    const diff = (day + 6) % 7;
-    value.setUTCDate(value.getUTCDate() - diff);
-    value.setUTCHours(0, 0, 0, 0);
-    return value;
-  }
-
-  value.setUTCDate(1);
-  value.setUTCHours(0, 0, 0, 0);
-  return value;
-}
-
-export async function recordUsage(params: {
-  projectId: string;
-  requestId: string;
+export function estimateCostUsd(input: {
   model: string;
   inputTokens: number;
   outputTokens: number;
-  costUsd: number;
-}): Promise<UsageEvent> {
-  const event: UsageEvent = {
-    id: randomUUID(),
-    projectId: params.projectId,
-    requestId: params.requestId,
-    model: params.model,
-    inputTokens: params.inputTokens,
-    outputTokens: params.outputTokens,
-    costUsd: params.costUsd,
-    createdAt: new Date().toISOString()
-  };
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
+}) {
+  const pricing = pricingForModel(input.model);
 
-  await addUsageEvent(event);
-  return event;
+  const cost =
+    (input.inputTokens / 1_000_000) * pricing.input +
+    (input.outputTokens / 1_000_000) * pricing.output +
+    (input.cacheCreationTokens / 1_000_000) * pricing.cacheCreation +
+    (input.cacheReadTokens / 1_000_000) * pricing.cacheRead;
+
+  return Number(cost.toFixed(6));
 }
 
-export async function usageTotals(projectId: string): Promise<{
-  daily: number;
-  weekly: number;
-  monthly: number;
-}> {
-  const events = await listUsageEvents(projectId);
-  const dailyStart = periodStart("daily").getTime();
-  const weeklyStart = periodStart("weekly").getTime();
-  const monthlyStart = periodStart("monthly").getTime();
+export function getPeriodStart(period: CapPeriod, now = new Date()) {
+  const date = new Date(now);
 
-  return events.reduce(
-    (totals, event) => {
-      const ts = new Date(event.createdAt).getTime();
+  if (period === "daily") {
+    date.setUTCHours(0, 0, 0, 0);
+    return date.toISOString();
+  }
 
-      if (ts >= dailyStart) {
-        totals.daily += event.costUsd;
-      }
+  if (period === "weekly") {
+    const day = date.getUTCDay();
+    const deltaToMonday = (day + 6) % 7;
+    date.setUTCDate(date.getUTCDate() - deltaToMonday);
+    date.setUTCHours(0, 0, 0, 0);
+    return date.toISOString();
+  }
 
-      if (ts >= weeklyStart) {
-        totals.weekly += event.costUsd;
-      }
-
-      if (ts >= monthlyStart) {
-        totals.monthly += event.costUsd;
-      }
-
-      return totals;
-    },
-    {
-      daily: 0,
-      weekly: 0,
-      monthly: 0
-    }
-  );
+  date.setUTCDate(1);
+  date.setUTCHours(0, 0, 0, 0);
+  return date.toISOString();
 }
 
-export async function usageSeries(projectId: string, days = 30): Promise<Array<{ date: string; costUsd: number }>> {
-  const events = await listUsageEvents(projectId);
-  const now = new Date();
-  const buckets = new Map<string, number>();
-
-  for (let i = days - 1; i >= 0; i -= 1) {
-    const date = new Date(now);
-    date.setUTCDate(now.getUTCDate() - i);
-    const key = date.toISOString().slice(0, 10);
-    buckets.set(key, 0);
-  }
-
-  events.forEach((event) => {
-    const key = event.createdAt.slice(0, 10);
-
-    if (buckets.has(key)) {
-      buckets.set(key, Number(((buckets.get(key) ?? 0) + event.costUsd).toFixed(6)));
-    }
-  });
-
-  return [...buckets.entries()].map(([date, costUsd]) => ({ date, costUsd }));
-}
-
-export async function limitStatus(project: Project): Promise<{
-  exceeded: null | "daily" | "weekly" | "monthly";
-  totals: { daily: number; weekly: number; monthly: number };
-  caps: BillingCaps;
-}> {
-  const totals = await usageTotals(project.id);
-
-  if (totals.daily >= project.caps.dailyUsd) {
-    return {
-      exceeded: "daily",
-      totals,
-      caps: project.caps
-    };
-  }
-
-  if (totals.weekly >= project.caps.weeklyUsd) {
-    return {
-      exceeded: "weekly",
-      totals,
-      caps: project.caps
-    };
-  }
-
-  if (totals.monthly >= project.caps.monthlyUsd) {
-    return {
-      exceeded: "monthly",
-      totals,
-      caps: project.caps
-    };
-  }
+export function getCurrentSpend(projectId: string) {
+  const dailyStart = getPeriodStart("daily");
+  const weeklyStart = getPeriodStart("weekly");
+  const monthlyStart = getPeriodStart("monthly");
 
   return {
-    exceeded: null,
-    totals,
-    caps: project.caps
+    daily: getSpendSince(projectId, dailyStart),
+    weekly: getSpendSince(projectId, weeklyStart),
+    monthly: getSpendSince(projectId, monthlyStart),
+    starts: {
+      daily: dailyStart,
+      weekly: weeklyStart,
+      monthly: monthlyStart
+    }
   };
 }
 
-export async function shouldSendLimitAlert(projectId: string, period: "daily" | "weekly" | "monthly"): Promise<boolean> {
-  const logs = await listAlertLogs(projectId);
-  const start = periodStart(period).toISOString();
+export function evaluateCapState(input: {
+  caps: { dailyCap: number; weeklyCap: number; monthlyCap: number };
+  spend: { daily: number; weekly: number; monthly: number };
+}) {
+  const states = {
+    daily: {
+      cap: input.caps.dailyCap,
+      spent: input.spend.daily,
+      remaining: Number((input.caps.dailyCap - input.spend.daily).toFixed(4)),
+      exceeded: input.spend.daily >= input.caps.dailyCap
+    },
+    weekly: {
+      cap: input.caps.weeklyCap,
+      spent: input.spend.weekly,
+      remaining: Number((input.caps.weeklyCap - input.spend.weekly).toFixed(4)),
+      exceeded: input.spend.weekly >= input.caps.weeklyCap
+    },
+    monthly: {
+      cap: input.caps.monthlyCap,
+      spent: input.spend.monthly,
+      remaining: Number((input.caps.monthlyCap - input.spend.monthly).toFixed(4)),
+      exceeded: input.spend.monthly >= input.caps.monthlyCap
+    }
+  };
 
-  const hasLog = logs.some((item) => item.period === period && item.periodStart === start);
-  return !hasLog;
+  const exceededPeriods = (Object.keys(states) as CapPeriod[]).filter((period) => states[period].exceeded);
+
+  return {
+    states,
+    exceededPeriods
+  };
 }
 
-export async function markLimitAlertSent(params: {
+export function recordUsageFromAnthropicResponse(input: {
   projectId: string;
-  period: "daily" | "weekly" | "monthly";
-  message: string;
-}): Promise<void> {
-  await addAlertLog({
-    id: randomUUID(),
-    projectId: params.projectId,
-    period: params.period,
-    periodStart: periodStart(params.period).toISOString(),
-    createdAt: new Date().toISOString(),
-    message: params.message
+  model: string;
+  usage: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_creation_input_tokens?: number;
+    cache_read_input_tokens?: number;
+  };
+}) {
+  const inputTokens = input.usage.input_tokens ?? 0;
+  const outputTokens = input.usage.output_tokens ?? 0;
+  const cacheCreationTokens = input.usage.cache_creation_input_tokens ?? 0;
+  const cacheReadTokens = input.usage.cache_read_input_tokens ?? 0;
+
+  const costUsd = estimateCostUsd({
+    model: input.model,
+    inputTokens,
+    outputTokens,
+    cacheCreationTokens,
+    cacheReadTokens
   });
+
+  recordUsageEvent({
+    projectId: input.projectId,
+    model: input.model,
+    inputTokens,
+    outputTokens,
+    cacheCreationTokens,
+    cacheReadTokens,
+    costUsd
+  });
+
+  return costUsd;
+}
+
+export function buildDailyUsageSeries(projectId: string, days: number) {
+  const now = new Date();
+  const start = new Date(now);
+  start.setUTCDate(now.getUTCDate() - (days - 1));
+  start.setUTCHours(0, 0, 0, 0);
+
+  const rows = getUsageSeries(projectId, start.toISOString());
+  const rowMap = new Map(rows.map((row) => [row.date, row.spend]));
+
+  const series: Array<{ date: string; spend: number }> = [];
+  const cursor = new Date(start);
+
+  while (cursor <= now) {
+    const day = cursor.toISOString().slice(0, 10);
+    series.push({
+      date: day,
+      spend: Number((rowMap.get(day) || 0).toFixed(6))
+    });
+
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+
+  return series;
 }

@@ -1,45 +1,32 @@
-import { NextResponse } from "next/server";
-import type { NextRequest } from "next/server";
-import { readSessionFromCookie, SESSION_COOKIE } from "@/lib/auth";
+import { NextResponse, type NextRequest } from "next/server";
 
-const AUTH_REQUIRED_PREFIXES = ["/dashboard", "/projects", "/api/projects", "/api/usage"];
-const PAID_REQUIRED_PREFIXES = ["/projects", "/api/projects", "/api/usage"];
-
-function pathStartsWith(pathname: string, candidates: string[]) {
-  return candidates.some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`));
-}
+import { SESSION_COOKIE, verifySessionToken } from "@/lib/session";
 
 export async function middleware(request: NextRequest) {
-  const pathname = request.nextUrl.pathname;
-
-  if (!pathStartsWith(pathname, AUTH_REQUIRED_PREFIXES)) {
-    return NextResponse.next();
-  }
-
   const token = request.cookies.get(SESSION_COOKIE)?.value;
-  const session = await readSessionFromCookie(token);
 
-  if (!session) {
-    if (pathname.startsWith("/api/")) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-
-    const url = new URL("/", request.url);
-    url.searchParams.set("redirect", pathname);
-    return NextResponse.redirect(url);
+  if (!token) {
+    return reject(request);
   }
 
-  if (pathStartsWith(pathname, PAID_REQUIRED_PREFIXES) && !session.paid) {
-    if (pathname.startsWith("/api/")) {
-      return NextResponse.json({ error: "Payment required" }, { status: 402 });
-    }
+  const payload = await verifySessionToken(token);
 
-    const url = new URL("/dashboard", request.url);
-    url.searchParams.set("billing", "required");
-    return NextResponse.redirect(url);
+  if (!payload?.email) {
+    return reject(request);
   }
 
   return NextResponse.next();
+}
+
+function reject(request: NextRequest) {
+  if (request.nextUrl.pathname.startsWith("/api/")) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const redirectUrl = request.nextUrl.clone();
+  redirectUrl.pathname = "/unlock";
+  redirectUrl.searchParams.set("next", request.nextUrl.pathname);
+  return NextResponse.redirect(redirectUrl);
 }
 
 export const config = {

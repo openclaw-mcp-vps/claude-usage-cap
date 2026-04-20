@@ -1,32 +1,32 @@
-import { NextRequest, NextResponse } from "next/server";
+import { upsertPurchase } from "@/lib/db";
+import { extractPaidEmail, verifyHostedCheckoutWebhook, type StripeWebhookEvent } from "@/lib/lemonsqueezy";
 
-import { applyLemonWebhook, verifyLemonSignature } from "@/lib/lemonsqueezy";
+export const runtime = "nodejs";
 
-export async function POST(request: NextRequest) {
-  if (!process.env.LEMON_SQUEEZY_WEBHOOK_SECRET) {
-    return NextResponse.json({ error: "Webhook secret not configured." }, { status: 500 });
+export async function POST(request: Request) {
+  const payload = await request.text();
+  const signature = request.headers.get("stripe-signature");
+
+  const verified = verifyHostedCheckoutWebhook(payload, signature);
+
+  if (!verified) {
+    return Response.json({ error: "Invalid webhook signature." }, { status: 401 });
   }
 
-  const rawBody = await request.text();
-  const signature = request.headers.get("x-signature");
-
-  if (!verifyLemonSignature(rawBody, signature)) {
-    return NextResponse.json({ error: "Invalid Lemon Squeezy signature." }, { status: 401 });
-  }
-
-  let payload: unknown;
-
+  let event: StripeWebhookEvent;
   try {
-    payload = JSON.parse(rawBody);
+    event = JSON.parse(payload) as StripeWebhookEvent;
   } catch {
-    return NextResponse.json({ error: "Invalid webhook JSON payload." }, { status: 400 });
+    return Response.json({ error: "Invalid webhook payload." }, { status: 400 });
   }
 
-  const result = await applyLemonWebhook(payload);
+  if (event.type === "checkout.session.completed" || event.type === "invoice.paid") {
+    const email = extractPaidEmail(event);
 
-  if (!result.ok) {
-    return NextResponse.json({ error: result.reason || "Webhook processing failed." }, { status: 400 });
+    if (email) {
+      upsertPurchase(email, "stripe");
+    }
   }
 
-  return NextResponse.json({ ok: true });
+  return Response.json({ received: true });
 }

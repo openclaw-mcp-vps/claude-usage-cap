@@ -1,28 +1,43 @@
 @import "tailwindcss";
 
 :root {
-  --background: #0d1117;
-  --foreground: #e6edf3;
-  --muted: #161b22;
-  --muted-foreground: #9da7b3;
-  --border: #30363d;
-  --primary: #2f81f7;
-  --primary-foreground: #f0f6fc;
-  --danger: #f85149;
-  --success: #3fb950;
+  color-scheme: dark;
+  --bg: #0d1117;
+  --bg-elev: #111827;
+  --bg-elev-2: #161f31;
+  --text: #e6edf3;
+  --muted: #94a3b8;
+  --line: #263243;
+  --accent: #38bdf8;
 }
 
 * {
-  border-color: var(--border);
+  border-color: var(--line);
 }
 
 html,
 body {
-  background: radial-gradient(circle at top right, #121a27 0%, #0d1117 45%, #0d1117 100%);
-  color: var(--foreground);
   min-height: 100%;
 }
 
-a {
-  color: inherit;
+body {
+  background:
+    radial-gradient(1200px 600px at 10% -20%, rgba(56, 189, 248, 0.18), transparent 55%),
+    radial-gradient(900px 500px at 95% 0%, rgba(34, 197, 94, 0.12), transparent 45%),
+    var(--bg);
+  color: var(--text);
+  font-family: var(--font-space-grotesk), ui-sans-serif, sans-serif;
+}
+
+code,
+pre,
+kbd {
+  font-family: var(--font-ibm-plex-mono), ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.grid-glow {
+  background-image:
+    linear-gradient(rgba(148, 163, 184, 0.08) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(148, 163, 184, 0.08) 1px, transparent 1px);
+  background-size: 36px 36px;
 }

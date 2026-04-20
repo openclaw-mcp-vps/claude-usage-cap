@@ -1,47 +1,42 @@
 "use client";
 
+import { useMemo } from "react";
 import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
-import { formatUsd } from "@/lib/utils";
+export function UsageChart({ data }: { data: Array<{ date: string; spend: number }> }) {
+  const chartData = useMemo(
+    () => data.map((point) => ({ ...point, label: point.date.slice(5) })),
+    [data]
+  );
 
-type UsagePoint = {
-  date: string;
-  costUsd: number;
-};
-
-export function UsageChart({ data }: { data: UsagePoint[] }) {
   return (
-    <div className="h-[320px] w-full rounded-xl border border-[#30363d] bg-[#111821]/70 p-4">
+    <div className="h-72 w-full rounded-xl border border-slate-800 bg-slate-950/70 p-3">
       <ResponsiveContainer width="100%" height="100%">
-        <AreaChart data={data}>
+        <AreaChart data={chartData} margin={{ top: 8, right: 14, left: 2, bottom: 2 }}>
           <defs>
-            <linearGradient id="usageGradient" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#2f81f7" stopOpacity={0.8} />
-              <stop offset="100%" stopColor="#2f81f7" stopOpacity={0.05} />
+            <linearGradient id="usageFill" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#38bdf8" stopOpacity={0.45} />
+              <stop offset="100%" stopColor="#38bdf8" stopOpacity={0.02} />
             </linearGradient>
           </defs>
-          <CartesianGrid stroke="#30363d" strokeDasharray="3 3" />
-          <XAxis
-            dataKey="date"
-            stroke="#9da7b3"
-            tickFormatter={(value: string) => value.slice(5)}
-            tick={{ fontSize: 12 }}
-          />
+          <CartesianGrid stroke="#1f2b3a" strokeDasharray="3 4" />
+          <XAxis dataKey="label" tick={{ fill: "#9ca3af", fontSize: 12 }} axisLine={{ stroke: "#334155" }} />
           <YAxis
-            stroke="#9da7b3"
-            tick={{ fontSize: 12 }}
-            tickFormatter={(value: number) => `$${value.toFixed(2)}`}
+            tick={{ fill: "#9ca3af", fontSize: 12 }}
+            axisLine={{ stroke: "#334155" }}
+            tickFormatter={(value) => `$${value.toFixed(2)}`}
           />
           <Tooltip
+            cursor={{ stroke: "#38bdf8", strokeWidth: 1 }}
             contentStyle={{
-              backgroundColor: "#0d1117",
-              borderColor: "#30363d",
-              color: "#e6edf3"
+              backgroundColor: "#0b1220",
+              borderColor: "#334155",
+              color: "#e5e7eb",
+              borderRadius: 10
             }}
-            formatter={(value: number) => [formatUsd(value), "Spend"]}
-            labelFormatter={(label) => `Date: ${label}`}
+            formatter={(value: number) => [`$${value.toFixed(4)}`, "Spend"]}
           />
-          <Area type="monotone" dataKey="costUsd" stroke="#2f81f7" fill="url(#usageGradient)" strokeWidth={2} />
+          <Area type="monotone" dataKey="spend" stroke="#38bdf8" strokeWidth={2.2} fill="url(#usageFill)" />
         </AreaChart>
       </ResponsiveContainer>
     </div>
