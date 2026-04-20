@@ -1,0 +1,78 @@
+// Reference schema for the Claude Usage Cap data model.
+// Runtime code uses direct SQL in lib/db.ts and does not use Prisma Client.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Subscription {
+  email            String   @id
+  status           String
+  customerId       String?  @map("customer_id")
+  subscriptionId   String?  @map("subscription_id")
+  orderId          String?  @map("order_id")
+  currentPeriodEnd DateTime? @map("current_period_end")
+  updatedAt        DateTime @default(now()) @map("updated_at")
+
+  @@map("subscriptions")
+}
+
+model Project {
+  id                  String   @id
+  ownerEmail          String   @map("owner_email")
+  name                String
+  anthropicKeyEncrypted String @map("anthropic_key_encrypted")
+  proxyKeyHash        String   @unique @map("proxy_key_hash")
+  proxyKeyLast4       String   @map("proxy_key_last4")
+  slackWebhookUrl     String?  @map("slack_webhook_url")
+  dailyCapUsd         Decimal  @map("daily_cap_usd")
+  weeklyCapUsd        Decimal  @map("weekly_cap_usd")
+  monthlyCapUsd       Decimal  @map("monthly_cap_usd")
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @default(now()) @map("updated_at")
+  usageEvents         UsageEvent[]
+  alertEvents         AlertEvent[]
+
+  @@index([ownerEmail], map: "idx_projects_owner_email")
+  @@map("projects")
+}
+
+model UsageEvent {
+  id                  BigInt   @id @default(autoincrement())
+  projectId           String   @map("project_id")
+  model               String
+  inputTokens         Int      @default(0) @map("input_tokens")
+  outputTokens        Int      @default(0) @map("output_tokens")
+  cacheCreationTokens Int      @default(0) @map("cache_creation_tokens")
+  cacheReadTokens     Int      @default(0) @map("cache_read_tokens")
+  costUsd             Decimal  @map("cost_usd")
+  createdAt           DateTime @default(now()) @map("created_at")
+  project             Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, createdAt], map: "idx_usage_events_project_created_at")
+  @@map("usage_events")
+}
+
+model AlertEvent {
+  id         BigInt   @id @default(autoincrement())
+  projectId  String   @map("project_id")
+  windowType String   @map("window_type")
+  windowStart DateTime @map("window_start")
+  sentAt     DateTime @default(now()) @map("sent_at")
+  project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, windowType, windowStart], map: "uniq_alert_window")
+  @@map("alert_events")
+}
+
+model ProcessedWebhook {
+  eventKey    String   @id @map("event_key")
+  processedAt DateTime @default(now()) @map("processed_at")
+
+  @@map("processed_webhooks")
+}

@@ -1,279 +1,221 @@
-import { hash } from "bcryptjs";
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import { readSessionFromCookie, SESSION_COOKIE } from "@/lib/auth";
-import { decryptSecret, encryptSecret, generateToken } from "@/lib/crypto";
-import { db, type ProjectRow, type UserRow } from "@/lib/db";
+import { getSessionFromRequest } from "@/lib/auth";
+import { hasActiveSubscription } from "@/lib/lemonsqueezy";
+import {
+  createProjectForOwner,
+  getProjectForOwner,
+  listProjectsForOwner,
+  rotateProjectProxyKey,
+  updateProjectForOwner
+} from "@/lib/projects";
 
-export const runtime = "nodejs";
-
-const createProjectSchema = z.object({
-  name: z.string().min(2).max(80),
-  anthropicKey: z.string().min(20).max(256),
-  dailyCapUsd: z.number().positive().max(100000),
-  weeklyCapUsd: z.number().positive().max(100000),
-  monthlyCapUsd: z.number().positive().max(100000),
-  slackWebhookUrl: z.string().url().optional().or(z.literal(""))
+const capSchema = z.object({
+  dailyCapUsd: z.number().min(0.5).max(50000),
+  weeklyCapUsd: z.number().min(0.5).max(50000),
+  monthlyCapUsd: z.number().min(0.5).max(50000)
 });
 
-const updateProjectSchema = z.object({
-  id: z.string().min(4),
+const createSchema = z.object({
+  name: z.string().min(2).max(80),
+  anthropicApiKey: z.string().min(20),
+  slackWebhookUrl: z
+    .string()
+    .url()
+    .includes("hooks.slack.com")
+    .optional()
+    .or(z.literal("")),
+  caps: capSchema
+});
+
+const patchSchema = z.object({
+  id: z.string().uuid(),
   name: z.string().min(2).max(80).optional(),
-  anthropicKey: z.string().min(20).max(256).optional(),
-  dailyCapUsd: z.number().positive().max(100000).optional(),
-  weeklyCapUsd: z.number().positive().max(100000).optional(),
-  monthlyCapUsd: z.number().positive().max(100000).optional(),
-  slackWebhookUrl: z.string().url().optional().or(z.literal("")),
+  anthropicApiKey: z.string().min(20).optional(),
+  slackWebhookUrl: z
+    .string()
+    .url()
+    .includes("hooks.slack.com")
+    .optional()
+    .or(z.literal("")),
+  caps: capSchema.partial().optional(),
   rotateProxyKey: z.boolean().optional()
 });
 
-type SessionUser = {
-  id: number;
-  email: string;
-  paid: boolean;
-};
+function validateCapConsistency(caps: {
+  dailyCapUsd: number;
+  weeklyCapUsd: number;
+  monthlyCapUsd: number;
+}): string | null {
+  if (caps.weeklyCapUsd < caps.dailyCapUsd) {
+    return "Weekly cap must be greater than or equal to daily cap.";
+  }
 
-function projectToResponse(project: ProjectRow) {
-  return {
-    id: project.id,
-    name: project.name,
-    proxyKeyPrefix: project.proxy_key_prefix,
-    dailyCapUsd: project.daily_cap_usd,
-    weeklyCapUsd: project.weekly_cap_usd,
-    monthlyCapUsd: project.monthly_cap_usd,
-    slackWebhookUrl: project.slack_webhook_url,
-    createdAt: project.created_at,
-    updatedAt: project.updated_at
-  };
+  if (caps.monthlyCapUsd < caps.weeklyCapUsd) {
+    return "Monthly cap must be greater than or equal to weekly cap.";
+  }
+
+  return null;
 }
 
-async function requirePaidUser(request: NextRequest): Promise<SessionUser | null> {
-  const token = request.cookies.get(SESSION_COOKIE)?.value;
-  const session = await readSessionFromCookie(token);
+async function requirePaidSession(request: NextRequest): Promise<
+  | {
+      email: string;
+    }
+  | NextResponse
+> {
+  const session = getSessionFromRequest(request);
+
   if (!session) {
-    return null;
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const user = db.prepare("SELECT * FROM users WHERE id = ? LIMIT 1").get(session.uid) as UserRow | undefined;
-  if (!user || !user.paid) {
-    return null;
+  const active = await hasActiveSubscription(session.email);
+
+  if (!active) {
+    return NextResponse.json(
+      { error: "Active subscription required." },
+      { status: 402 }
+    );
   }
 
-  return {
-    id: user.id,
-    email: user.email,
-    paid: Boolean(user.paid)
-  };
+  return session;
 }
 
 export async function GET(request: NextRequest) {
-  const user = await requirePaidUser(request);
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized or unpaid" }, { status: 402 });
+  const sessionOrResponse = await requirePaidSession(request);
+
+  if (sessionOrResponse instanceof NextResponse) {
+    return sessionOrResponse;
   }
 
-  const id = request.nextUrl.searchParams.get("id");
-
-  if (id) {
-    const project = db
-      .prepare("SELECT * FROM projects WHERE id = ? AND user_id = ? LIMIT 1")
-      .get(id, user.id) as ProjectRow | undefined;
-
-    if (!project) {
-      return NextResponse.json({ error: "Project not found" }, { status: 404 });
-    }
-
-    return NextResponse.json({
-      project: {
-        ...projectToResponse(project),
-        anthropicKeyMasked: `${decryptSecret(project.anthropic_key_encrypted).slice(0, 8)}••••••••`
-      }
-    });
-  }
-
-  const projects = db
-    .prepare("SELECT * FROM projects WHERE user_id = ? ORDER BY created_at DESC")
-    .all(user.id) as ProjectRow[];
-
-  return NextResponse.json({
-    projects: projects.map(projectToResponse)
-  });
+  const projects = await listProjectsForOwner(sessionOrResponse.email);
+  return NextResponse.json({ projects });
 }
 
 export async function POST(request: NextRequest) {
-  const user = await requirePaidUser(request);
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized or unpaid" }, { status: 402 });
+  const sessionOrResponse = await requirePaidSession(request);
+
+  if (sessionOrResponse instanceof NextResponse) {
+    return sessionOrResponse;
   }
 
-  const body = await request.json().catch(() => null);
-  const parsed = createProjectSchema.safeParse(body);
+  let body: unknown;
+
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+  }
+
+  const parsed = createSchema.safeParse(body);
 
   if (!parsed.success) {
-    return NextResponse.json({ error: "Invalid project payload" }, { status: 400 });
+    return NextResponse.json(
+      { error: parsed.error.flatten().fieldErrors },
+      { status: 400 }
+    );
   }
 
-  const projectId = generateToken("proj_");
-  const proxyKey = generateToken("cuc_");
-  const proxyKeyHash = await hash(proxyKey, 10);
+  const capError = validateCapConsistency(parsed.data.caps);
 
-  db.prepare(
-    `INSERT INTO projects (
-      id,
-      user_id,
-      name,
-      anthropic_key_encrypted,
-      proxy_key_hash,
-      proxy_key_prefix,
-      daily_cap_usd,
-      weekly_cap_usd,
-      monthly_cap_usd,
-      slack_webhook_url,
-      created_at,
-      updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`
-  ).run(
-    projectId,
-    user.id,
-    parsed.data.name.trim(),
-    encryptSecret(parsed.data.anthropicKey.trim()),
-    proxyKeyHash,
-    proxyKey.slice(0, 16),
-    parsed.data.dailyCapUsd,
-    parsed.data.weeklyCapUsd,
-    parsed.data.monthlyCapUsd,
-    parsed.data.slackWebhookUrl?.trim() ? parsed.data.slackWebhookUrl.trim() : null
-  );
-
-  const project = db
-    .prepare("SELECT * FROM projects WHERE id = ? AND user_id = ? LIMIT 1")
-    .get(projectId, user.id) as ProjectRow | undefined;
-
-  if (!project) {
-    return NextResponse.json({ error: "Failed to create project" }, { status: 500 });
+  if (capError) {
+    return NextResponse.json({ error: capError }, { status: 400 });
   }
+
+  const created = await createProjectForOwner({
+    ownerEmail: sessionOrResponse.email,
+    name: parsed.data.name,
+    anthropicApiKey: parsed.data.anthropicApiKey,
+    slackWebhookUrl:
+      parsed.data.slackWebhookUrl && parsed.data.slackWebhookUrl.length > 0
+        ? parsed.data.slackWebhookUrl
+        : null,
+    caps: parsed.data.caps
+  });
 
   return NextResponse.json(
     {
-      project: projectToResponse(project),
-      proxyKey
+      project: created.project,
+      proxyKey: created.proxyKey
     },
     { status: 201 }
   );
 }
 
 export async function PATCH(request: NextRequest) {
-  const user = await requirePaidUser(request);
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized or unpaid" }, { status: 402 });
+  const sessionOrResponse = await requirePaidSession(request);
+
+  if (sessionOrResponse instanceof NextResponse) {
+    return sessionOrResponse;
   }
 
-  const body = await request.json().catch(() => null);
-  const parsed = updateProjectSchema.safeParse(body);
+  let body: unknown;
+
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+  }
+
+  const parsed = patchSchema.safeParse(body);
 
   if (!parsed.success) {
-    return NextResponse.json({ error: "Invalid update payload" }, { status: 400 });
+    return NextResponse.json(
+      { error: parsed.error.flatten().fieldErrors },
+      { status: 400 }
+    );
   }
 
-  const existing = db
-    .prepare("SELECT * FROM projects WHERE id = ? AND user_id = ? LIMIT 1")
-    .get(parsed.data.id, user.id) as ProjectRow | undefined;
+  const existing = await getProjectForOwner(sessionOrResponse.email, parsed.data.id);
 
   if (!existing) {
     return NextResponse.json({ error: "Project not found" }, { status: 404 });
   }
 
-  let nextProxyKeyHash = existing.proxy_key_hash;
-  let nextProxyPrefix = existing.proxy_key_prefix;
-  let rotatedProxyKey: string | null = null;
+  const mergedCaps = {
+    dailyCapUsd: parsed.data.caps?.dailyCapUsd ?? existing.dailyCapUsd,
+    weeklyCapUsd: parsed.data.caps?.weeklyCapUsd ?? existing.weeklyCapUsd,
+    monthlyCapUsd: parsed.data.caps?.monthlyCapUsd ?? existing.monthlyCapUsd
+  };
 
-  if (parsed.data.rotateProxyKey) {
-    rotatedProxyKey = generateToken("cuc_");
-    nextProxyKeyHash = await hash(rotatedProxyKey, 10);
-    nextProxyPrefix = rotatedProxyKey.slice(0, 16);
+  const capError = validateCapConsistency(mergedCaps);
+
+  if (capError) {
+    return NextResponse.json({ error: capError }, { status: 400 });
   }
 
-  const nextName = parsed.data.name?.trim() ?? existing.name;
-  const nextEncryptedAnthropicKey = parsed.data.anthropicKey
-    ? encryptSecret(parsed.data.anthropicKey.trim())
-    : existing.anthropic_key_encrypted;
-  const nextDailyCap = parsed.data.dailyCapUsd ?? existing.daily_cap_usd;
-  const nextWeeklyCap = parsed.data.weeklyCapUsd ?? existing.weekly_cap_usd;
-  const nextMonthlyCap = parsed.data.monthlyCapUsd ?? existing.monthly_cap_usd;
-  const nextSlackWebhook =
-    parsed.data.slackWebhookUrl === undefined
-      ? existing.slack_webhook_url
-      : parsed.data.slackWebhookUrl?.trim()
-        ? parsed.data.slackWebhookUrl.trim()
-        : null;
-
-  db.prepare(
-    `UPDATE projects
-     SET name = ?,
-         anthropic_key_encrypted = ?,
-         proxy_key_hash = ?,
-         proxy_key_prefix = ?,
-         daily_cap_usd = ?,
-         weekly_cap_usd = ?,
-         monthly_cap_usd = ?,
-         slack_webhook_url = ?,
-         updated_at = datetime('now')
-     WHERE id = ? AND user_id = ?`
-  ).run(
-    nextName,
-    nextEncryptedAnthropicKey,
-    nextProxyKeyHash,
-    nextProxyPrefix,
-    nextDailyCap,
-    nextWeeklyCap,
-    nextMonthlyCap,
-    nextSlackWebhook,
-    parsed.data.id,
-    user.id
-  );
-
-  const updated = db
-    .prepare("SELECT * FROM projects WHERE id = ? AND user_id = ? LIMIT 1")
-    .get(parsed.data.id, user.id) as ProjectRow | undefined;
+  const updated = await updateProjectForOwner({
+    ownerEmail: sessionOrResponse.email,
+    projectId: parsed.data.id,
+    name: parsed.data.name,
+    anthropicApiKey: parsed.data.anthropicApiKey,
+    slackWebhookUrl:
+      parsed.data.slackWebhookUrl !== undefined
+        ? parsed.data.slackWebhookUrl || null
+        : undefined,
+    caps: parsed.data.caps
+  });
 
   if (!updated) {
-    return NextResponse.json({ error: "Failed to update project" }, { status: 500 });
-  }
-
-  return NextResponse.json({
-    project: projectToResponse(updated),
-    proxyKey: rotatedProxyKey
-  });
-}
-
-export async function DELETE(request: NextRequest) {
-  const user = await requirePaidUser(request);
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized or unpaid" }, { status: 402 });
-  }
-
-  const id = request.nextUrl.searchParams.get("id");
-  if (!id) {
-    return NextResponse.json({ error: "Missing project id" }, { status: 400 });
-  }
-
-  const existing = db
-    .prepare("SELECT id FROM projects WHERE id = ? AND user_id = ? LIMIT 1")
-    .get(id, user.id) as { id: string } | undefined;
-
-  if (!existing) {
     return NextResponse.json({ error: "Project not found" }, { status: 404 });
   }
 
-  db.prepare("DELETE FROM projects WHERE id = ? AND user_id = ?").run(id, user.id);
+  if (parsed.data.rotateProxyKey) {
+    const rotated = await rotateProjectProxyKey({
+      ownerEmail: sessionOrResponse.email,
+      projectId: parsed.data.id
+    });
 
-  return NextResponse.json({ ok: true });
-}
+    if (!rotated) {
+      return NextResponse.json(
+        { error: "Unable to rotate proxy key" },
+        { status: 500 }
+      );
+    }
 
-export async function OPTIONS() {
-  return NextResponse.json({ allow: ["GET", "POST", "PATCH", "DELETE"] });
-}
+    return NextResponse.json({ project: rotated.project, proxyKey: rotated.proxyKey });
+  }
 
-export async function HEAD() {
-  return new NextResponse(null, { status: 200 });
+  return NextResponse.json({ project: updated });
 }

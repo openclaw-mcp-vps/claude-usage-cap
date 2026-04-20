@@ -1,183 +1,205 @@
-import { compare } from "bcryptjs";
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import { createAnthropicClient, estimateAnthropicCostUsd } from "@/lib/anthropic";
-import { decryptSecret } from "@/lib/crypto";
-import { db, type ProjectRow } from "@/lib/db";
-import { sendCapAlertIfNeeded } from "@/lib/slack-alerts";
 import {
-  firstExceededCap,
-  getPeriodKeys,
-  isOverAnyCap,
-  readCurrentSpend,
-  writeUsageEvent
+  estimateClaudeCostUsd,
+  sendClaudeRequest
+} from "@/lib/anthropic-proxy";
+import { hasActiveSubscription } from "@/lib/lemonsqueezy";
+import { getProjectForProxyKey } from "@/lib/projects";
+import { sendCapExceededAlert } from "@/lib/slack-alerts";
+import {
+  evaluateCapStatus,
+  getUsageTotals,
+  recordUsageEvent,
+  type WindowType
 } from "@/lib/usage-tracker";
 
 export const runtime = "nodejs";
 
-const requestSchema = z
+const ProxyPayloadSchema = z
   .object({
     model: z.string().min(1),
     max_tokens: z.number().int().positive(),
-    stream: z.boolean().optional()
+    messages: z.array(z.any()).min(1)
   })
   .passthrough();
 
-type ProjectWithUser = ProjectRow & {
-  user_paid: number;
-};
+function extractBearerToken(request: NextRequest): string | null {
+  const header = request.headers.get("authorization");
 
-function parseProxyKey(request: NextRequest) {
-  const authHeader = request.headers.get("authorization") ?? "";
-  const [scheme, token] = authHeader.split(" ");
-  if (scheme?.toLowerCase() !== "bearer" || !token) {
+  if (!header || !header.toLowerCase().startsWith("bearer ")) {
     return null;
   }
-  return token.trim();
+
+  const token = header.slice("bearer ".length).trim();
+  return token.length > 0 ? token : null;
 }
 
-async function resolveProjectByProxyKey(proxyKey: string): Promise<ProjectWithUser | null> {
-  const candidates = db
-    .prepare(
-      `SELECT p.*, u.paid AS user_paid
-       FROM projects p
-       INNER JOIN users u ON u.id = p.user_id
-       WHERE p.proxy_key_prefix = ?`
+async function notifyExceededCaps(input: {
+  project: {
+    id: string;
+    name: string;
+    slackWebhookUrl: string | null;
+    dailyCapUsd: number;
+    weeklyCapUsd: number;
+    monthlyCapUsd: number;
+  };
+  exceeded: Array<{ window: WindowType; total: number; cap: number }>;
+}): Promise<void> {
+  await Promise.all(
+    input.exceeded.map((item) =>
+      sendCapExceededAlert({
+        project: input.project,
+        windowType: item.window,
+        totalUsd: item.total,
+        capUsd: item.cap
+      }).catch(() => ({ sent: false }))
     )
-    .all(proxyKey.slice(0, 16)) as ProjectWithUser[];
-
-  if (!candidates.length) {
-    return null;
-  }
-
-  for (const candidate of candidates) {
-    const matches = await compare(proxyKey, candidate.proxy_key_hash);
-    if (matches) {
-      return candidate;
-    }
-  }
-
-  return null;
+  );
 }
 
 export async function POST(request: NextRequest) {
-  const proxyKey = parseProxyKey(request);
+  const proxyKey = extractBearerToken(request);
+
   if (!proxyKey) {
-    return NextResponse.json({ error: "Missing Bearer proxy key" }, { status: 401 });
+    return NextResponse.json(
+      { error: "Missing or invalid Bearer proxy key" },
+      { status: 401 }
+    );
   }
 
-  const project = await resolveProjectByProxyKey(proxyKey);
+  const project = await getProjectForProxyKey(proxyKey);
+
   if (!project) {
     return NextResponse.json({ error: "Invalid proxy key" }, { status: 401 });
   }
 
-  if (!project.user_paid) {
+  const paid = await hasActiveSubscription(project.ownerEmail);
+
+  if (!paid) {
     return NextResponse.json(
-      { error: "Project owner subscription inactive. Tool access is paywalled." },
+      {
+        error:
+          "Subscription inactive. Proxy requests are disabled until billing is active."
+      },
       { status: 402 }
     );
   }
 
-  const body = await request.json().catch(() => null);
-  const parsed = requestSchema.safeParse(body);
+  let body: unknown;
 
-  if (!parsed.success) {
-    return NextResponse.json({ error: "Invalid Claude request payload" }, { status: 400 });
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
-  if (parsed.data.stream) {
+  const parsed = ProxyPayloadSchema.safeParse(body);
+
+  if (!parsed.success) {
     return NextResponse.json(
-      { error: "Streaming mode is not supported yet through this proxy" },
+      { error: "Body must match Anthropic message format" },
       { status: 400 }
     );
   }
 
-  const keys = getPeriodKeys();
-  const spendBefore = readCurrentSpend(project.id, keys);
-  const caps = {
-    dailyCapUsd: project.daily_cap_usd,
-    weeklyCapUsd: project.weekly_cap_usd,
-    monthlyCapUsd: project.monthly_cap_usd
-  };
+  const totalsBefore = await getUsageTotals(project.id);
+  const statusBefore = evaluateCapStatus(project, totalsBefore);
 
-  if (isOverAnyCap(spendBefore, caps)) {
-    const exceeded = firstExceededCap(spendBefore, caps);
-    if (exceeded) {
-      await sendCapAlertIfNeeded({
-        projectId: project.id,
-        projectName: project.name,
-        periodType: exceeded.periodType,
-        periodKey: keys[exceeded.periodType],
-        currentSpendUsd: exceeded.value,
-        capUsd: exceeded.cap,
-        slackWebhookUrl: project.slack_webhook_url
-      });
-    }
+  if (statusBefore.exceeded.length > 0) {
+    await notifyExceededCaps({
+      project,
+      exceeded: statusBefore.exceeded
+    });
 
     return NextResponse.json(
       {
-        error: "Usage cap reached. Proxy traffic blocked until cap window resets.",
-        spend: spendBefore,
+        error: "Spend cap exceeded for this project. Proxy access is temporarily blocked.",
         caps: {
-          daily: project.daily_cap_usd,
-          weekly: project.weekly_cap_usd,
-          monthly: project.monthly_cap_usd
-        }
+          daily: project.dailyCapUsd,
+          weekly: project.weeklyCapUsd,
+          monthly: project.monthlyCapUsd
+        },
+        totals: totalsBefore,
+        exceeded: statusBefore.exceeded
       },
       { status: 429 }
     );
   }
 
   try {
-    const anthropic = createAnthropicClient(decryptSecret(project.anthropic_key_encrypted));
-    const completion = await anthropic.messages.create(parsed.data as never);
+    const anthropicResponse = await sendClaudeRequest({
+      anthropicApiKey: project.anthropicApiKey,
+      payload: parsed.data
+    });
 
-    const usage = completion.usage ?? {};
-    const inputTokens = usage.input_tokens ?? 0;
-    const outputTokens = usage.output_tokens ?? 0;
-    const cacheCreationTokens = usage.cache_creation_input_tokens ?? 0;
-    const cacheReadTokens = usage.cache_read_input_tokens ?? 0;
-    const costUsd = estimateAnthropicCostUsd(parsed.data.model, usage);
+    const usage = (anthropicResponse.usage ?? {}) as Record<string, unknown>;
+    const model =
+      (typeof anthropicResponse.model === "string" && anthropicResponse.model) ||
+      parsed.data.model;
 
-    writeUsageEvent({
+    const inputTokens = Number(usage.input_tokens ?? 0);
+    const outputTokens = Number(usage.output_tokens ?? 0);
+    const cacheCreationTokens = Number(
+      usage.cache_creation_input_tokens ?? usage.cache_creation_tokens ?? 0
+    );
+    const cacheReadTokens = Number(
+      usage.cache_read_input_tokens ?? usage.cache_read_tokens ?? 0
+    );
+
+    const estimatedCostUsd = estimateClaudeCostUsd(model, {
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      cache_creation_input_tokens: cacheCreationTokens,
+      cache_read_input_tokens: cacheReadTokens
+    });
+
+    await recordUsageEvent({
       projectId: project.id,
-      requestId: completion.id,
-      model: parsed.data.model,
+      model,
       inputTokens,
       outputTokens,
       cacheCreationTokens,
       cacheReadTokens,
-      costUsd,
-      keys
+      costUsd: estimatedCostUsd
     });
 
-    const spendAfter = readCurrentSpend(project.id, keys);
-    const exceededAfter = firstExceededCap(spendAfter, caps);
+    const totalsAfter = await getUsageTotals(project.id);
+    const statusAfter = evaluateCapStatus(project, totalsAfter);
 
-    if (exceededAfter) {
-      await sendCapAlertIfNeeded({
-        projectId: project.id,
-        projectName: project.name,
-        periodType: exceededAfter.periodType,
-        periodKey: keys[exceededAfter.periodType],
-        currentSpendUsd: exceededAfter.value,
-        capUsd: exceededAfter.cap,
-        slackWebhookUrl: project.slack_webhook_url
-      });
+    if (statusAfter.exceeded.length > 0) {
+      await notifyExceededCaps({ project, exceeded: statusAfter.exceeded });
     }
 
-    return NextResponse.json(completion);
+    const response = NextResponse.json(anthropicResponse);
+    response.headers.set("x-claw-request-cost-usd", estimatedCostUsd.toFixed(6));
+    response.headers.set("x-claw-day-spend-usd", totalsAfter.day.toFixed(6));
+    response.headers.set("x-claw-week-spend-usd", totalsAfter.week.toFixed(6));
+    response.headers.set("x-claw-month-spend-usd", totalsAfter.month.toFixed(6));
+
+    return response;
   } catch (error: unknown) {
     const status =
-      typeof error === "object" && error && "status" in error && typeof error.status === "number"
-        ? error.status
-        : 502;
+      typeof error === "object" &&
+      error !== null &&
+      "status" in error &&
+      typeof (error as { status?: unknown }).status === "number"
+        ? ((error as { status: number }).status ?? 500)
+        : 500;
 
     const message =
-      typeof error === "object" && error && "message" in error && typeof error.message === "string"
-        ? error.message
-        : "Failed to forward request to Anthropic";
+      typeof error === "object" &&
+      error !== null &&
+      "message" in error &&
+      typeof (error as { message?: unknown }).message === "string"
+        ? (error as { message: string }).message
+        : "Anthropic proxy request failed";
 
-    return NextResponse.json({ error: message }, { status });
+    return NextResponse.json(
+      {
+        error: message
+      },
+      { status }
+    );
   }
 }

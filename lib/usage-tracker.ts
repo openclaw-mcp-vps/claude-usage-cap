@@ -1,166 +1,176 @@
-import { db } from "@/lib/db";
+import { sql, sqlOne } from "@/lib/db";
+import type { ProjectSummary } from "@/lib/projects";
 
-export type SpendCaps = {
-  dailyCapUsd: number;
-  weeklyCapUsd: number;
-  monthlyCapUsd: number;
-};
-
-export type SpendSnapshot = {
-  daily: number;
-  weekly: number;
-  monthly: number;
-};
-
-export type PeriodKeys = {
-  day: string;
-  week: string;
-  month: string;
-};
-
-export type CapPeriodType = keyof PeriodKeys;
-
-type UsageWriteInput = {
+export type UsageEventInput = {
   projectId: string;
-  requestId: string | null;
   model: string;
   inputTokens: number;
   outputTokens: number;
   cacheCreationTokens: number;
   cacheReadTokens: number;
   costUsd: number;
-  keys: PeriodKeys;
 };
 
-function toIsoDate(date: Date) {
-  return date.toISOString().slice(0, 10);
+export type UsageTotals = {
+  day: number;
+  week: number;
+  month: number;
+};
+
+export type UsagePoint = {
+  day: string;
+  costUsd: number;
+};
+
+export type WindowType = "day" | "week" | "month";
+
+function toUtcDayStart(date: Date): Date {
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
 }
 
-function getIsoWeekKey(date: Date) {
-  const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
-  const day = d.getUTCDay() || 7;
-  d.setUTCDate(d.getUTCDate() + 4 - day);
-  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
-  const week = Math.ceil((((d.getTime() - yearStart.getTime()) / 86400000) + 1) / 7);
-  return `${d.getUTCFullYear()}-W${String(week).padStart(2, "0")}`;
+function toUtcMonthStart(date: Date): Date {
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1));
 }
 
-export function getPeriodKeys(now = new Date()): PeriodKeys {
+function toUtcWeekStart(date: Date): Date {
+  const dayStart = toUtcDayStart(date);
+  const day = dayStart.getUTCDay();
+  const daysFromMonday = (day + 6) % 7;
+  dayStart.setUTCDate(dayStart.getUTCDate() - daysFromMonday);
+  return dayStart;
+}
+
+export function getUsageWindows(now = new Date()): {
+  dayStart: Date;
+  weekStart: Date;
+  monthStart: Date;
+} {
   return {
-    day: toIsoDate(now),
-    week: getIsoWeekKey(now),
-    month: now.toISOString().slice(0, 7)
+    dayStart: toUtcDayStart(now),
+    weekStart: toUtcWeekStart(now),
+    monthStart: toUtcMonthStart(now)
   };
 }
 
-export function readCurrentSpend(projectId: string, keys = getPeriodKeys()): SpendSnapshot {
-  const dailyRow = db
-    .prepare("SELECT COALESCE(SUM(cost_usd), 0) AS value FROM usage_events WHERE project_id = ? AND period_day = ?")
-    .get(projectId, keys.day) as { value: number };
-
-  const weeklyRow = db
-    .prepare("SELECT COALESCE(SUM(cost_usd), 0) AS value FROM usage_events WHERE project_id = ? AND period_week = ?")
-    .get(projectId, keys.week) as { value: number };
-
-  const monthlyRow = db
-    .prepare("SELECT COALESCE(SUM(cost_usd), 0) AS value FROM usage_events WHERE project_id = ? AND period_month = ?")
-    .get(projectId, keys.month) as { value: number };
-
-  return {
-    daily: Number(dailyRow.value ?? 0),
-    weekly: Number(weeklyRow.value ?? 0),
-    monthly: Number(monthlyRow.value ?? 0)
-  };
-}
-
-export function isOverAnyCap(spend: SpendSnapshot, caps: SpendCaps) {
-  return (
-    spend.daily >= caps.dailyCapUsd ||
-    spend.weekly >= caps.weeklyCapUsd ||
-    spend.monthly >= caps.monthlyCapUsd
-  );
-}
-
-export function firstExceededCap(
-  spend: SpendSnapshot,
-  caps: SpendCaps
-): { periodType: CapPeriodType; value: number; cap: number } | null {
-  if (spend.daily >= caps.dailyCapUsd) {
-    return { periodType: "day", value: spend.daily, cap: caps.dailyCapUsd };
-  }
-  if (spend.weekly >= caps.weeklyCapUsd) {
-    return { periodType: "week", value: spend.weekly, cap: caps.weeklyCapUsd };
-  }
-  if (spend.monthly >= caps.monthlyCapUsd) {
-    return { periodType: "month", value: spend.monthly, cap: caps.monthlyCapUsd };
-  }
-  return null;
-}
-
-export function writeUsageEvent(input: UsageWriteInput) {
-  db.prepare(
-    `INSERT INTO usage_events (
+export async function recordUsageEvent(input: UsageEventInput): Promise<void> {
+  await sql(
+    `
+    INSERT INTO usage_events (
       project_id,
-      request_id,
       model,
       input_tokens,
       output_tokens,
       cache_creation_tokens,
       cache_read_tokens,
-      cost_usd,
-      period_day,
-      period_week,
-      period_month
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    input.projectId,
-    input.requestId,
-    input.model,
-    input.inputTokens,
-    input.outputTokens,
-    input.cacheCreationTokens,
-    input.cacheReadTokens,
-    input.costUsd,
-    input.keys.day,
-    input.keys.week,
-    input.keys.month
+      cost_usd
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7)
+    `,
+    [
+      input.projectId,
+      input.model,
+      input.inputTokens,
+      input.outputTokens,
+      input.cacheCreationTokens,
+      input.cacheReadTokens,
+      input.costUsd
+    ]
   );
 }
 
-export function readUsageSeries(projectId: string, days = 30) {
-  const rows = db
-    .prepare(
-      `SELECT period_day AS day, ROUND(SUM(cost_usd), 6) AS spend
-       FROM usage_events
-       WHERE project_id = ?
-         AND created_at >= datetime('now', ?)
-       GROUP BY period_day
-       ORDER BY period_day ASC`
-    )
-    .all(projectId, `-${Math.max(days, 1)} days`) as { day: string; spend: number }[];
+export async function getUsageTotals(projectId: string, now = new Date()): Promise<UsageTotals> {
+  const { dayStart, weekStart, monthStart } = getUsageWindows(now);
 
-  return rows.map((row) => ({
-    day: row.day,
-    spend: Number(row.spend ?? 0)
-  }));
+  const [dayRow, weekRow, monthRow] = await Promise.all([
+    sqlOne<{ total: string }>(
+      `SELECT COALESCE(SUM(cost_usd), 0) AS total FROM usage_events WHERE project_id = $1 AND created_at >= $2`,
+      [projectId, dayStart.toISOString()]
+    ),
+    sqlOne<{ total: string }>(
+      `SELECT COALESCE(SUM(cost_usd), 0) AS total FROM usage_events WHERE project_id = $1 AND created_at >= $2`,
+      [projectId, weekStart.toISOString()]
+    ),
+    sqlOne<{ total: string }>(
+      `SELECT COALESCE(SUM(cost_usd), 0) AS total FROM usage_events WHERE project_id = $1 AND created_at >= $2`,
+      [projectId, monthStart.toISOString()]
+    )
+  ]);
+
+  return {
+    day: Number(dayRow?.total ?? 0),
+    week: Number(weekRow?.total ?? 0),
+    month: Number(monthRow?.total ?? 0)
+  };
 }
 
-export function wasAlertSent(projectId: string, periodType: string, periodKey: string) {
-  const row = db
-    .prepare(
-      "SELECT id FROM sent_alerts WHERE project_id = ? AND period_type = ? AND period_key = ? LIMIT 1"
-    )
-    .get(projectId, periodType, periodKey) as { id?: number } | undefined;
+export async function getDailyUsageSeries(
+  projectId: string,
+  days = 30,
+  now = new Date()
+): Promise<UsagePoint[]> {
+  const cappedDays = Math.max(1, Math.min(days, 120));
+  const dayStart = toUtcDayStart(now);
+  const rangeStart = new Date(dayStart);
+  rangeStart.setUTCDate(rangeStart.getUTCDate() - (cappedDays - 1));
 
-  return Boolean(row?.id);
+  const rows = await sql<{ day: string; total: string }>(
+    `
+    SELECT
+      DATE_TRUNC('day', created_at)::date::text AS day,
+      COALESCE(SUM(cost_usd), 0) AS total
+    FROM usage_events
+    WHERE project_id = $1 AND created_at >= $2
+    GROUP BY DATE_TRUNC('day', created_at)
+    ORDER BY DATE_TRUNC('day', created_at)
+    `,
+    [projectId, rangeStart.toISOString()]
+  );
+
+  const lookup = new Map<string, number>();
+  rows.forEach((row) => {
+    lookup.set(row.day, Number(row.total));
+  });
+
+  const points: UsagePoint[] = [];
+
+  for (let i = 0; i < cappedDays; i += 1) {
+    const pointDate = new Date(rangeStart);
+    pointDate.setUTCDate(rangeStart.getUTCDate() + i);
+    const key = pointDate.toISOString().slice(0, 10);
+
+    points.push({
+      day: key,
+      costUsd: lookup.get(key) ?? 0
+    });
+  }
+
+  return points;
 }
 
-export function markAlertSent(projectId: string, periodType: string, periodKey: string) {
-  db.prepare(
-    `INSERT OR IGNORE INTO sent_alerts (
-      project_id,
-      period_type,
-      period_key
-    ) VALUES (?, ?, ?)`
-  ).run(projectId, periodType, periodKey);
+export function evaluateCapStatus(project: ProjectSummary, totals: UsageTotals): {
+  exceeded: Array<{ window: WindowType; total: number; cap: number }>;
+  remaining: { day: number; week: number; month: number };
+} {
+  const exceeded: Array<{ window: WindowType; total: number; cap: number }> = [];
+
+  if (totals.day >= project.dailyCapUsd) {
+    exceeded.push({ window: "day", total: totals.day, cap: project.dailyCapUsd });
+  }
+
+  if (totals.week >= project.weeklyCapUsd) {
+    exceeded.push({ window: "week", total: totals.week, cap: project.weeklyCapUsd });
+  }
+
+  if (totals.month >= project.monthlyCapUsd) {
+    exceeded.push({ window: "month", total: totals.month, cap: project.monthlyCapUsd });
+  }
+
+  return {
+    exceeded,
+    remaining: {
+      day: Math.max(0, project.dailyCapUsd - totals.day),
+      week: Math.max(0, project.weeklyCapUsd - totals.week),
+      month: Math.max(0, project.monthlyCapUsd - totals.month)
+    }
+  };
 }

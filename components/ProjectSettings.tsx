@@ -1,273 +1,206 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useState } from "react";
+import { AlertTriangle, KeyRound, Save, ShieldCheck } from "lucide-react";
 
-type Project = {
+type ProjectSettingsModel = {
   id: string;
   name: string;
-  proxyKeyPrefix: string;
+  slackWebhookUrl: string | null;
   dailyCapUsd: number;
   weeklyCapUsd: number;
   monthlyCapUsd: number;
-  slackWebhookUrl: string | null;
-  createdAt: string;
-  updatedAt: string;
+  proxyKeyLast4: string;
 };
 
-type SaveResult = {
-  project: Project;
-  proxyKey?: string | null;
-};
-
-type Props = {
-  mode: "create" | "edit";
-  project?: Project;
-  onSaved?: (result: SaveResult) => void;
-};
-
-export function ProjectSettings({ mode, project, onSaved }: Props) {
-  const [name, setName] = useState(project?.name ?? "");
-  const [anthropicKey, setAnthropicKey] = useState("");
-  const [dailyCapUsd, setDailyCapUsd] = useState(project?.dailyCapUsd.toString() ?? "10");
-  const [weeklyCapUsd, setWeeklyCapUsd] = useState(project?.weeklyCapUsd.toString() ?? "50");
-  const [monthlyCapUsd, setMonthlyCapUsd] = useState(project?.monthlyCapUsd.toString() ?? "150");
-  const [slackWebhookUrl, setSlackWebhookUrl] = useState(project?.slackWebhookUrl ?? "");
-  const [proxyKey, setProxyKey] = useState<string | null>(null);
+export function ProjectSettings({ project }: { project: ProjectSettingsModel }) {
+  const [name, setName] = useState(project.name);
+  const [anthropicApiKey, setAnthropicApiKey] = useState("");
+  const [slackWebhookUrl, setSlackWebhookUrl] = useState(project.slackWebhookUrl ?? "");
+  const [dailyCapUsd, setDailyCapUsd] = useState(String(project.dailyCapUsd));
+  const [weeklyCapUsd, setWeeklyCapUsd] = useState(String(project.weeklyCapUsd));
+  const [monthlyCapUsd, setMonthlyCapUsd] = useState(String(project.monthlyCapUsd));
+  const [submitting, setSubmitting] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [pending, setPending] = useState(false);
+  const [newProxyKey, setNewProxyKey] = useState<string | null>(null);
 
-  const submitLabel = mode === "create" ? "Create project" : "Save changes";
-
-  const hasChange = useMemo(() => {
-    if (mode === "create") {
-      return true;
-    }
-
-    if (!project) {
-      return false;
-    }
-
-    return (
-      name !== project.name ||
-      dailyCapUsd !== project.dailyCapUsd.toString() ||
-      weeklyCapUsd !== project.weeklyCapUsd.toString() ||
-      monthlyCapUsd !== project.monthlyCapUsd.toString() ||
-      slackWebhookUrl !== (project.slackWebhookUrl ?? "") ||
-      anthropicKey.length > 0
-    );
-  }, [anthropicKey, dailyCapUsd, mode, monthlyCapUsd, name, project, slackWebhookUrl, weeklyCapUsd]);
-
-  async function submitForm(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setPending(true);
-    setError(null);
-    setMessage(null);
-
-    const payload: Record<string, unknown> = {
-      name: name.trim(),
-      dailyCapUsd: Number(dailyCapUsd),
-      weeklyCapUsd: Number(weeklyCapUsd),
-      monthlyCapUsd: Number(monthlyCapUsd),
-      slackWebhookUrl: slackWebhookUrl.trim()
-    };
-
-    if (mode === "create") {
-      payload.anthropicKey = anthropicKey.trim();
-    }
-
-    if (mode === "edit") {
-      payload.id = project?.id;
-      if (anthropicKey.trim()) {
-        payload.anthropicKey = anthropicKey.trim();
-      }
-    }
-
-    try {
-      const response = await fetch("/api/projects", {
-        method: mode === "create" ? "POST" : "PATCH",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-
-      const result = (await response.json()) as {
-        error?: string;
-        project?: Project;
-        proxyKey?: string | null;
-      };
-
-      if (!response.ok || !result.project) {
-        setError(result.error ?? "Could not save project settings");
-        return;
-      }
-
-      setProxyKey(result.proxyKey ?? null);
-      setMessage(mode === "create" ? "Project created." : "Project updated.");
-      setAnthropicKey("");
-      onSaved?.({ project: result.project, proxyKey: result.proxyKey ?? null });
-
-      if (mode === "create") {
-        setName("");
-      }
-    } catch (saveError) {
-      setError(saveError instanceof Error ? saveError.message : "Unexpected save error");
-    } finally {
-      setPending(false);
-    }
-  }
-
-  async function rotateKey() {
-    if (!project?.id) {
-      return;
-    }
-
-    setPending(true);
-    setError(null);
+  async function updateSettings() {
+    setSubmitting(true);
     setMessage(null);
 
     try {
       const response = await fetch("/api/projects", {
         method: "PATCH",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ id: project.id, rotateProxyKey: true })
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          id: project.id,
+          name,
+          anthropicApiKey: anthropicApiKey || undefined,
+          slackWebhookUrl,
+          caps: {
+            dailyCapUsd: Number(dailyCapUsd),
+            weeklyCapUsd: Number(weeklyCapUsd),
+            monthlyCapUsd: Number(monthlyCapUsd)
+          }
+        })
       });
 
-      const result = (await response.json()) as {
-        error?: string;
-        project?: Project;
-        proxyKey?: string | null;
-      };
+      const data = (await response.json()) as { error?: string };
 
-      if (!response.ok || !result.project) {
-        setError(result.error ?? "Failed to rotate key");
-        return;
+      if (!response.ok) {
+        throw new Error(data.error ?? "Failed to update project settings");
       }
 
-      if (result.proxyKey) {
-        setProxyKey(result.proxyKey);
-      }
-
-      setMessage("Proxy key rotated.");
-      onSaved?.({ project: result.project, proxyKey: result.proxyKey ?? null });
-    } catch (rotateError) {
-      setError(rotateError instanceof Error ? rotateError.message : "Unexpected rotation error");
+      setAnthropicApiKey("");
+      setMessage("Project settings saved.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Failed to update project settings");
     } finally {
-      setPending(false);
+      setSubmitting(false);
+    }
+  }
+
+  async function rotateProxyKey() {
+    setSubmitting(true);
+    setMessage(null);
+
+    try {
+      const response = await fetch("/api/projects", {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          id: project.id,
+          rotateProxyKey: true
+        })
+      });
+
+      const data = (await response.json()) as { proxyKey?: string; error?: string };
+
+      if (!response.ok || !data.proxyKey) {
+        throw new Error(data.error ?? "Failed to rotate proxy key");
+      }
+
+      setNewProxyKey(data.proxyKey);
+      setMessage("Proxy key rotated. Update your workloads immediately.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Failed to rotate proxy key");
+    } finally {
+      setSubmitting(false);
     }
   }
 
   return (
-    <section className="rounded-xl border border-slate-800 bg-slate-900/60 p-5">
-      <h3 className="text-lg font-semibold">{mode === "create" ? "Create Project" : "Project Settings"}</h3>
-      <p className="mt-1 text-sm text-slate-400">
-        {mode === "create"
-          ? "Register Anthropic credentials, set hard spend caps, and generate a proxy key."
-          : "Adjust limits, update secrets, and rotate the proxy key without redeploying your app."}
-      </p>
+    <div className="space-y-4 rounded-2xl border border-[#1f2937] bg-[#111827]/80 p-5">
+      <div className="flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-[#9ca3af]">
+        <ShieldCheck size={16} />
+        Project Settings
+      </div>
 
-      <form onSubmit={submitForm} className="mt-4 grid gap-3 md:grid-cols-2">
-        <label className="block text-sm text-slate-300 md:col-span-2">
-          Project name
-          <input
-            required
-            value={name}
-            onChange={(event) => setName(event.target.value)}
-            className="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 outline-none transition focus:border-emerald-500"
-            placeholder="Production API"
-          />
-        </label>
+      <label className="flex flex-col gap-2 text-sm text-[#cbd5e1]">
+        Project Name
+        <input
+          value={name}
+          onChange={(event) => setName(event.target.value)}
+          className="rounded-lg border border-[#334155] bg-[#0f172a] px-3 py-2 text-[#e6edf3] outline-none transition focus:border-[#22c55e]"
+        />
+      </label>
 
-        <label className="block text-sm text-slate-300 md:col-span-2">
-          Anthropic API key {mode === "edit" ? "(optional for update)" : ""}
-          <input
-            required={mode === "create"}
-            value={anthropicKey}
-            onChange={(event) => setAnthropicKey(event.target.value)}
-            className="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs outline-none transition focus:border-emerald-500"
-            placeholder="sk-ant-..."
-          />
-        </label>
+      <label className="flex flex-col gap-2 text-sm text-[#cbd5e1]">
+        Anthropic API Key
+        <input
+          value={anthropicApiKey}
+          onChange={(event) => setAnthropicApiKey(event.target.value)}
+          placeholder="Paste a new key only when rotating credentials"
+          className="rounded-lg border border-[#334155] bg-[#0f172a] px-3 py-2 text-[#e6edf3] outline-none transition focus:border-[#22c55e]"
+        />
+      </label>
 
-        <label className="block text-sm text-slate-300">
-          Daily cap (USD)
+      <label className="flex flex-col gap-2 text-sm text-[#cbd5e1]">
+        Slack Alert Webhook URL
+        <input
+          value={slackWebhookUrl}
+          onChange={(event) => setSlackWebhookUrl(event.target.value)}
+          placeholder="https://hooks.slack.com/services/..."
+          className="rounded-lg border border-[#334155] bg-[#0f172a] px-3 py-2 text-[#e6edf3] outline-none transition focus:border-[#22c55e]"
+        />
+      </label>
+
+      <div className="grid gap-3 md:grid-cols-3">
+        <label className="flex flex-col gap-2 text-sm text-[#cbd5e1]">
+          Daily Cap (USD)
           <input
-            required
             type="number"
-            min={1}
-            step="0.01"
+            min={0.5}
+            step="0.5"
             value={dailyCapUsd}
             onChange={(event) => setDailyCapUsd(event.target.value)}
-            className="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 outline-none transition focus:border-emerald-500"
+            className="rounded-lg border border-[#334155] bg-[#0f172a] px-3 py-2 text-[#e6edf3] outline-none transition focus:border-[#22c55e]"
           />
         </label>
-
-        <label className="block text-sm text-slate-300">
-          Weekly cap (USD)
+        <label className="flex flex-col gap-2 text-sm text-[#cbd5e1]">
+          Weekly Cap (USD)
           <input
-            required
             type="number"
-            min={1}
-            step="0.01"
+            min={0.5}
+            step="0.5"
             value={weeklyCapUsd}
             onChange={(event) => setWeeklyCapUsd(event.target.value)}
-            className="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 outline-none transition focus:border-emerald-500"
+            className="rounded-lg border border-[#334155] bg-[#0f172a] px-3 py-2 text-[#e6edf3] outline-none transition focus:border-[#22c55e]"
           />
         </label>
-
-        <label className="block text-sm text-slate-300">
-          Monthly cap (USD)
+        <label className="flex flex-col gap-2 text-sm text-[#cbd5e1]">
+          Monthly Cap (USD)
           <input
-            required
             type="number"
-            min={1}
-            step="0.01"
+            min={0.5}
+            step="0.5"
             value={monthlyCapUsd}
             onChange={(event) => setMonthlyCapUsd(event.target.value)}
-            className="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 outline-none transition focus:border-emerald-500"
+            className="rounded-lg border border-[#334155] bg-[#0f172a] px-3 py-2 text-[#e6edf3] outline-none transition focus:border-[#22c55e]"
           />
         </label>
+      </div>
 
-        <label className="block text-sm text-slate-300">
-          Slack webhook (optional)
-          <input
-            value={slackWebhookUrl}
-            onChange={(event) => setSlackWebhookUrl(event.target.value)}
-            className="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 outline-none transition focus:border-emerald-500"
-            placeholder="https://hooks.slack.com/services/..."
-          />
-        </label>
+      <div className="rounded-lg border border-[#334155] bg-[#0f172a] px-4 py-3 text-sm text-[#cbd5e1]">
+        Active proxy key ends with <span className="font-mono">{project.proxyKeyLast4}</span>
+      </div>
 
-        <div className="md:col-span-2 flex flex-wrap gap-2">
-          <button
-            type="submit"
-            disabled={pending || !hasChange}
-            className="rounded-md bg-emerald-500 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            {pending ? "Saving..." : submitLabel}
-          </button>
+      <div className="flex flex-wrap gap-3">
+        <button
+          onClick={updateSettings}
+          disabled={submitting}
+          className="inline-flex items-center gap-2 rounded-lg bg-[#22c55e] px-4 py-2 text-sm font-semibold text-[#04120a] transition hover:bg-[#16a34a] disabled:opacity-50"
+        >
+          <Save size={16} />
+          Save Settings
+        </button>
 
-          {mode === "edit" ? (
-            <button
-              type="button"
-              disabled={pending}
-              onClick={rotateKey}
-              className="rounded-md border border-amber-400/50 bg-amber-400/10 px-4 py-2 text-sm font-semibold text-amber-200 transition hover:bg-amber-400/20 disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              Rotate proxy key
-            </button>
-          ) : null}
-        </div>
-      </form>
+        <button
+          onClick={rotateProxyKey}
+          disabled={submitting}
+          className="inline-flex items-center gap-2 rounded-lg border border-[#f59e0b] bg-[#2a1f09] px-4 py-2 text-sm font-semibold text-[#fbbf24] transition hover:bg-[#3a2d10] disabled:opacity-50"
+        >
+          <KeyRound size={16} />
+          Rotate Proxy Key
+        </button>
+      </div>
 
-      {message ? <p className="mt-3 text-sm text-emerald-300">{message}</p> : null}
-      {error ? <p className="mt-3 text-sm text-red-400">{error}</p> : null}
-
-      {proxyKey ? (
-        <div className="mt-4 rounded-md border border-emerald-500/40 bg-emerald-500/10 p-3">
-          <p className="text-xs uppercase tracking-[0.14em] text-emerald-300">Proxy key (shown once)</p>
-          <code className="mt-1 block overflow-x-auto whitespace-nowrap text-sm text-emerald-100">{proxyKey}</code>
+      {newProxyKey ? (
+        <div className="rounded-lg border border-[#14532d] bg-[#052e16] px-4 py-3 text-sm text-[#bbf7d0]">
+          New proxy key (shown once): <span className="font-mono">{newProxyKey}</span>
         </div>
       ) : null}
-    </section>
+
+      {message ? (
+        <div className="inline-flex items-center gap-2 rounded-lg border border-[#334155] bg-[#0f172a] px-3 py-2 text-sm text-[#cbd5e1]">
+          <AlertTriangle size={15} />
+          {message}
+        </div>
+      ) : null}
+    </div>
   );
 }

@@ -1,63 +1,76 @@
 import { NextRequest, NextResponse } from "next/server";
-import { readSessionFromCookie, SESSION_COOKIE } from "@/lib/auth";
-import { db, type ProjectRow, type UserRow } from "@/lib/db";
-import { getPeriodKeys, readCurrentSpend, readUsageSeries } from "@/lib/usage-tracker";
+import { z } from "zod";
+import { getSessionFromRequest } from "@/lib/auth";
+import { hasActiveSubscription } from "@/lib/lemonsqueezy";
+import { getProjectForOwner } from "@/lib/projects";
+import {
+  evaluateCapStatus,
+  getDailyUsageSeries,
+  getUsageTotals
+} from "@/lib/usage-tracker";
 
-export const runtime = "nodejs";
+const querySchema = z.object({
+  projectId: z.string().uuid(),
+  days: z
+    .string()
+    .optional()
+    .transform((value) => {
+      if (!value) {
+        return 30;
+      }
 
-async function requirePaidUser(request: NextRequest) {
-  const token = request.cookies.get(SESSION_COOKIE)?.value;
-  const session = await readSessionFromCookie(token);
-  if (!session) {
-    return null;
-  }
+      const parsed = Number(value);
 
-  const user = db.prepare("SELECT * FROM users WHERE id = ? LIMIT 1").get(session.uid) as UserRow | undefined;
-  if (!user || !user.paid) {
-    return null;
-  }
+      if (!Number.isFinite(parsed)) {
+        return 30;
+      }
 
-  return user;
-}
+      return Math.max(7, Math.min(90, Math.floor(parsed)));
+    })
+});
 
 export async function GET(request: NextRequest) {
-  const user = await requirePaidUser(request);
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized or unpaid" }, { status: 402 });
+  const session = getSessionFromRequest(request);
+
+  if (!session) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const projectId = request.nextUrl.searchParams.get("projectId");
-  const daysParam = Number(request.nextUrl.searchParams.get("days") ?? "30");
-  const days = Number.isFinite(daysParam) ? Math.max(1, Math.min(180, Math.floor(daysParam))) : 30;
+  const paid = await hasActiveSubscription(session.email);
 
-  if (!projectId) {
-    return NextResponse.json({ error: "Missing projectId" }, { status: 400 });
+  if (!paid) {
+    return NextResponse.json(
+      { error: "Active subscription required." },
+      { status: 402 }
+    );
   }
 
-  const project = db
-    .prepare("SELECT * FROM projects WHERE id = ? AND user_id = ? LIMIT 1")
-    .get(projectId, user.id) as ProjectRow | undefined;
+  const parsed = querySchema.safeParse({
+    projectId: request.nextUrl.searchParams.get("projectId"),
+    days: request.nextUrl.searchParams.get("days") ?? undefined
+  });
+
+  if (!parsed.success) {
+    return NextResponse.json({ error: "projectId is required" }, { status: 400 });
+  }
+
+  const project = await getProjectForOwner(session.email, parsed.data.projectId);
 
   if (!project) {
     return NextResponse.json({ error: "Project not found" }, { status: 404 });
   }
 
-  const keys = getPeriodKeys();
-  const spend = readCurrentSpend(project.id, keys);
-  const series = readUsageSeries(project.id, days);
+  const [totals, series] = await Promise.all([
+    getUsageTotals(project.id),
+    getDailyUsageSeries(project.id, parsed.data.days)
+  ]);
+
+  const capStatus = evaluateCapStatus(project, totals);
 
   return NextResponse.json({
-    project: {
-      id: project.id,
-      name: project.name,
-      caps: {
-        daily: project.daily_cap_usd,
-        weekly: project.weekly_cap_usd,
-        monthly: project.monthly_cap_usd
-      }
-    },
-    spend,
-    periodKeys: keys,
+    project,
+    totals,
+    capStatus,
     series
   });
 }

@@ -1,36 +1,54 @@
 import type { Metadata } from "next";
-import Script from "next/script";
+import { JetBrains_Mono, Space_Grotesk } from "next/font/google";
 import "./globals.css";
-import { Geist } from "next/font/google";
-import { cn } from "@/lib/utils";
 
-const geist = Geist({subsets:['latin'],variable:'--font-sans'});
+const spaceGrotesk = Space_Grotesk({
+  subsets: ["latin"],
+  variable: "--font-space-grotesk"
+});
+
+const jetBrainsMono = JetBrains_Mono({
+  subsets: ["latin"],
+  variable: "--font-jetbrains-mono"
+});
 
 export const metadata: Metadata = {
-  metadataBase: new URL("https://claude-usage-cap.example.com"),
-  title: "Claude Usage Cap | Spend Limits for Anthropic API",
+  metadataBase: new URL("https://claude-usage-cap.com"),
+  title: {
+    default: "Claude Usage Cap",
+    template: "%s | Claude Usage Cap"
+  },
   description:
-    "Set per-project day/week/month spend limits for Claude API traffic. Route through a secure proxy and auto-cut off buggy jobs before they burn your budget.",
+    "Set daily, weekly, and monthly spend caps on Claude API usage per project. Auto-cut off runaway jobs and send Slack alerts the moment limits are hit.",
   keywords: [
-    "Claude API cost control",
-    "Anthropic budget limits",
-    "AI spend cap",
-    "API proxy",
-    "runaway AI spend"
+    "Claude API budget cap",
+    "Anthropic proxy",
+    "AI cost control",
+    "SaaS founder tools",
+    "runaway spend prevention"
   ],
   openGraph: {
     title: "Claude Usage Cap",
     description:
-      "Per-project spend limits on Claude API with automatic 429 cutoff and Slack alerts.",
+      "Per-project spend limits on the Claude API with automatic 429 cut-off and Slack alerts.",
+    url: "https://claude-usage-cap.com",
+    siteName: "Claude Usage Cap",
     type: "website",
-    url: "https://claude-usage-cap.example.com",
-    siteName: "Claude Usage Cap"
+    images: [
+      {
+        url: "/opengraph-image",
+        width: 1200,
+        height: 630,
+        alt: "Claude Usage Cap"
+      }
+    ]
   },
   twitter: {
     card: "summary_large_image",
     title: "Claude Usage Cap",
     description:
-      "Prevent runaway Anthropic spend with per-project caps and automatic proxy cutoff."
+      "Per-project spend limits on Claude API usage. Auto-cutoff at cap + Slack alert.",
+    images: ["/opengraph-image"]
   }
 };
 
@@ -40,9 +58,11 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className={cn("dark", "font-sans", geist.variable)}>
-      <body>
-        <Script src="https://app.lemonsqueezy.com/js/lemon.js" strategy="afterInteractive" />
+    <html lang="en" className="dark">
+      <body
+        className={`${spaceGrotesk.variable} ${jetBrainsMono.variable} bg-[#0d1117] text-[#e6edf3] antialiased`}
+        style={{ fontFamily: "var(--font-space-grotesk), sans-serif" }}
+      >
         {children}
       </body>
     </html>

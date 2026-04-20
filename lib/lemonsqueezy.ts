@@ -1,132 +1,247 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
-import * as Lemon from "@lemonsqueezy/lemonsqueezy.js";
+import crypto from "crypto";
+import { sql, sqlOne } from "@/lib/db";
 
-function appBaseUrl() {
-  return process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000";
+export type SubscriptionRecord = {
+  email: string;
+  status: string;
+  customerId: string | null;
+  subscriptionId: string | null;
+  orderId: string | null;
+  currentPeriodEnd: string | null;
+  updatedAt: string;
+};
+
+type LemonWebhookPayload = {
+  meta?: {
+    event_name?: string;
+    custom_data?: Record<string, unknown>;
+  };
+  data?: {
+    id?: string;
+    type?: string;
+    attributes?: {
+      status?: string;
+      user_email?: string;
+      customer_email?: string;
+      customer_id?: number | string;
+      order_id?: number | string;
+      subscription_id?: number | string;
+      renews_at?: string;
+      ends_at?: string;
+      cancelled?: boolean;
+    };
+  };
+};
+
+function mapSubscriptionRow(row: {
+  email: string;
+  status: string;
+  customer_id: string | null;
+  subscription_id: string | null;
+  order_id: string | null;
+  current_period_end: string | null;
+  updated_at: string;
+}): SubscriptionRecord {
+  return {
+    email: row.email,
+    status: row.status,
+    customerId: row.customer_id,
+    subscriptionId: row.subscription_id,
+    orderId: row.order_id,
+    currentPeriodEnd: row.current_period_end,
+    updatedAt: row.updated_at
+  };
 }
 
-export async function createCheckoutUrl({
-  userId,
-  email,
-  checkoutToken
-}: {
-  userId: number;
-  email: string;
-  checkoutToken: string;
-}) {
-  const storeId = process.env.NEXT_PUBLIC_LEMON_SQUEEZY_STORE_ID;
-  const productId = process.env.NEXT_PUBLIC_LEMON_SQUEEZY_PRODUCT_ID;
-  const apiKey = process.env.LEMON_SQUEEZY_API_KEY;
-  const successUrl = `${appBaseUrl()}/purchase/success?checkout=${encodeURIComponent(checkoutToken)}`;
+export function verifyLemonSqueezySignature(input: {
+  payload: string;
+  signature: string | null;
+}): boolean {
+  const secret = process.env.LEMON_SQUEEZY_WEBHOOK_SECRET;
 
-  if (storeId && productId && apiKey) {
-    try {
-      const sdk = Lemon as unknown as {
-        lemonSqueezySetup?: (params: { apiKey: string }) => void;
-        createCheckout?: (...args: unknown[]) => Promise<unknown>;
-      };
-
-      sdk.lemonSqueezySetup?.({ apiKey });
-
-      const response = await sdk.createCheckout?.(Number(storeId), Number(productId), {
-        checkoutData: {
-          email,
-          custom: {
-            checkoutToken,
-            userId
-          }
-        },
-        checkoutOptions: {
-          embed: true,
-          media: false,
-          logo: true
-        },
-        productOptions: {
-          redirectUrl: successUrl
-        }
-      });
-
-      const checkoutUrl =
-        (response as { data?: { data?: { attributes?: { url?: string } } } })?.data?.data?.attributes?.url;
-
-      if (checkoutUrl) {
-        return checkoutUrl;
-      }
-    } catch (error) {
-      console.error("Failed to create Lemon Squeezy checkout via API", error);
-    }
+  if (!secret || !input.signature) {
+    return false;
   }
+
+  const digest = crypto.createHmac("sha256", secret).update(input.payload).digest("hex");
+
+  const digestBuffer = Buffer.from(digest, "utf8");
+  const signatureBuffer = Buffer.from(input.signature, "utf8");
+
+  if (digestBuffer.length !== signatureBuffer.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(digestBuffer, signatureBuffer);
+}
+
+export function isSubscriptionActiveStatus(status: string | null | undefined): boolean {
+  if (!status) {
+    return false;
+  }
+
+  const normalized = status.toLowerCase();
+
+  return ["active", "on_trial", "trialing", "paid", "past_due"].includes(normalized);
+}
+
+export function buildLemonCheckoutUrl(email?: string): string {
+  const storeId = process.env.NEXT_PUBLIC_LEMON_SQUEEZY_STORE_ID ?? "";
+  const productId = process.env.NEXT_PUBLIC_LEMON_SQUEEZY_PRODUCT_ID ?? "";
 
   if (!productId) {
-    throw new Error("Missing NEXT_PUBLIC_LEMON_SQUEEZY_PRODUCT_ID");
+    return "https://www.lemonsqueezy.com";
   }
 
-  const params = new URLSearchParams({
-    embed: "1",
-    "checkout[email]": email,
-    "checkout[custom][checkoutToken]": checkoutToken,
-    "checkout[custom][userId]": String(userId),
-    "checkout[success_url]": successUrl
-  });
+  const url = new URL(`https://app.lemonsqueezy.com/checkout/buy/${productId}`);
+  url.searchParams.set("embed", "1");
+  url.searchParams.set("media", "0");
+  url.searchParams.set("logo", "0");
+  if (storeId) {
+    url.searchParams.set("store", storeId);
+  }
 
-  return `https://app.lemonsqueezy.com/checkout/buy/${productId}?${params.toString()}`;
+  if (email) {
+    url.searchParams.set("checkout[email]", email);
+  }
+
+  return url.toString();
 }
 
-export function verifyWebhookSignature(rawBody: string, signatureHeader?: string | null) {
-  const secret = process.env.LEMON_SQUEEZY_WEBHOOK_SECRET;
-  if (!secret) {
+export async function getSubscriptionByEmail(
+  email: string
+): Promise<SubscriptionRecord | null> {
+  const row = await sqlOne<{
+    email: string;
+    status: string;
+    customer_id: string | null;
+    subscription_id: string | null;
+    order_id: string | null;
+    current_period_end: string | null;
+    updated_at: string;
+  }>(
+    `
+    SELECT
+      email,
+      status,
+      customer_id,
+      subscription_id,
+      order_id,
+      current_period_end,
+      updated_at
+    FROM subscriptions
+    WHERE email = $1
+    LIMIT 1
+    `,
+    [email.toLowerCase()]
+  );
+
+  if (!row) {
+    return null;
+  }
+
+  return mapSubscriptionRow(row);
+}
+
+export async function hasActiveSubscription(email: string): Promise<boolean> {
+  const record = await getSubscriptionByEmail(email);
+
+  if (!record) {
     return false;
   }
 
-  if (!signatureHeader) {
-    return false;
-  }
-
-  const expected = createHmac("sha256", secret).update(rawBody).digest("hex");
-  const received = signatureHeader.trim();
-
-  try {
-    return timingSafeEqual(Buffer.from(expected, "utf8"), Buffer.from(received, "utf8"));
-  } catch {
-    return false;
-  }
+  return isSubscriptionActiveStatus(record.status);
 }
 
-function readString(value: unknown) {
-  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+async function wasWebhookProcessed(eventKey: string): Promise<boolean> {
+  const row = await sqlOne<{ event_key: string }>(
+    `SELECT event_key FROM processed_webhooks WHERE event_key = $1 LIMIT 1`,
+    [eventKey]
+  );
+
+  return Boolean(row);
 }
 
-export function extractCheckoutToken(payload: Record<string, unknown>) {
-  const meta = payload.meta as Record<string, unknown> | undefined;
-  const attributes = (payload.data as { attributes?: Record<string, unknown> } | undefined)?.attributes;
-
-  const fromMetaCustom =
-    (meta?.custom_data as Record<string, unknown> | undefined)?.checkoutToken ??
-    (meta?.custom_data as Record<string, unknown> | undefined)?.checkout_token;
-
-  const fromAttrCustom =
-    (attributes?.custom_data as Record<string, unknown> | undefined)?.checkoutToken ??
-    (attributes?.custom_data as Record<string, unknown> | undefined)?.checkout_token;
-
-  return readString(fromMetaCustom) ?? readString(fromAttrCustom);
-}
-
-export function extractOrderId(payload: Record<string, unknown>) {
-  const attributes = (payload.data as { id?: string; attributes?: Record<string, unknown> } | undefined)
-    ?.attributes;
-
-  return (
-    readString((payload.data as { id?: string } | undefined)?.id) ??
-    readString(attributes?.order_number) ??
-    readString(attributes?.identifier)
+async function markWebhookProcessed(eventKey: string): Promise<void> {
+  await sql(
+    `
+    INSERT INTO processed_webhooks (event_key)
+    VALUES ($1)
+    ON CONFLICT (event_key) DO NOTHING
+    `,
+    [eventKey]
   );
 }
 
-export function extractBuyerEmail(payload: Record<string, unknown>) {
-  const attributes = (payload.data as { attributes?: Record<string, unknown> } | undefined)?.attributes;
-  return (
-    readString(attributes?.user_email) ??
-    readString(attributes?.email) ??
-    readString((payload.meta as Record<string, unknown> | undefined)?.user_email)
+export async function applyLemonWebhook(
+  payload: LemonWebhookPayload
+): Promise<{ ignored: boolean; reason?: string }> {
+  const eventName = payload.meta?.event_name ?? "unknown";
+  const dataId = payload.data?.id ?? "no-id";
+  const eventKey = `${eventName}:${dataId}`;
+
+  if (await wasWebhookProcessed(eventKey)) {
+    return { ignored: true, reason: "Webhook already processed" };
+  }
+
+  const attrs = payload.data?.attributes ?? {};
+  const emailCandidate =
+    (attrs.user_email as string | undefined) ??
+    (attrs.customer_email as string | undefined) ??
+    (payload.meta?.custom_data?.email as string | undefined);
+
+  if (!emailCandidate) {
+    await markWebhookProcessed(eventKey);
+    return { ignored: true, reason: "No customer email found in webhook" };
+  }
+
+  const email = emailCandidate.toLowerCase();
+  const incomingStatus = (attrs.status as string | undefined) ?? "inactive";
+
+  let status = incomingStatus;
+
+  if (eventName.includes("cancel") || attrs.cancelled) {
+    status = "cancelled";
+  }
+
+  if (eventName === "order_created" && !attrs.status) {
+    status = "active";
+  }
+
+  const currentPeriodEnd =
+    (attrs.renews_at as string | undefined) ?? (attrs.ends_at as string | undefined) ?? null;
+
+  await sql(
+    `
+    INSERT INTO subscriptions (
+      email,
+      status,
+      customer_id,
+      subscription_id,
+      order_id,
+      current_period_end,
+      updated_at
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,NOW())
+    ON CONFLICT (email)
+    DO UPDATE SET
+      status = EXCLUDED.status,
+      customer_id = COALESCE(EXCLUDED.customer_id, subscriptions.customer_id),
+      subscription_id = COALESCE(EXCLUDED.subscription_id, subscriptions.subscription_id),
+      order_id = COALESCE(EXCLUDED.order_id, subscriptions.order_id),
+      current_period_end = COALESCE(EXCLUDED.current_period_end, subscriptions.current_period_end),
+      updated_at = NOW()
+    `,
+    [
+      email,
+      status,
+      attrs.customer_id ? String(attrs.customer_id) : null,
+      attrs.subscription_id ? String(attrs.subscription_id) : payload.data?.id ?? null,
+      attrs.order_id ? String(attrs.order_id) : null,
+      currentPeriodEnd
+    ]
   );
+
+  await markWebhookProcessed(eventKey);
+  return { ignored: false };
 }

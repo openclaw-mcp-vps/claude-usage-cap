@@ -11,7 +11,7 @@ NICHE: ai-cost-tools
 PRICE: $$15/mo per project/mo
 
 ARCHITECTURE SPEC:
-A proxy service that sits between users and the Claude API, tracking usage against configurable spending limits per project. When limits are exceeded, the proxy blocks requests and sends Slack alerts, preventing runaway costs from buggy or experimental code.
+A proxy service that sits between users and the Claude API, tracking usage against configurable spend limits per project. When limits are exceeded, the proxy blocks requests and sends Slack alerts, preventing runaway costs from bugs or experimental code.
 
 PLANNED FILES:
 - app/api/proxy/route.ts
@@ -23,13 +23,13 @@ PLANNED FILES:
 - app/projects/[id]/page.tsx
 - components/UsageChart.tsx
 - components/ProjectSettings.tsx
-- lib/anthropic.ts
+- lib/anthropic-proxy.ts
 - lib/usage-tracker.ts
 - lib/slack-alerts.ts
 - lib/lemonsqueezy.ts
-- middleware.ts
+- prisma/schema.prisma
 
-DEPENDENCIES: next, tailwindcss, @anthropic-ai/sdk, prisma, @prisma/client, @lemonsqueezy/lemonsqueezy.js, @slack/web-api, jose, bcryptjs, recharts, lucide-react, zod
+DEPENDENCIES: next, tailwindcss, prisma, @prisma/client, next-auth, @anthropic-ai/sdk, axios, @lemonsqueezy/lemonsqueezy.js, recharts, lucide-react, zod, stripe
 
 REQUIREMENTS:
 - Next.js 15 with App Router (app/ directory)

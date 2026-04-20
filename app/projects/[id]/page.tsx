@@ -1,170 +1,96 @@
-"use client";
-
 import Link from "next/link";
-import { useParams, useRouter } from "next/navigation";
-import { useCallback, useEffect, useState } from "react";
+import { notFound, redirect } from "next/navigation";
 import { ProjectSettings } from "@/components/ProjectSettings";
 import { UsageChart } from "@/components/UsageChart";
+import { getSessionFromServerCookies } from "@/lib/auth";
+import { hasActiveSubscription } from "@/lib/lemonsqueezy";
+import { getProjectForOwner } from "@/lib/projects";
+import {
+  evaluateCapStatus,
+  getDailyUsageSeries,
+  getUsageTotals
+} from "@/lib/usage-tracker";
 
-type Project = {
-  id: string;
-  name: string;
-  proxyKeyPrefix: string;
-  dailyCapUsd: number;
-  weeklyCapUsd: number;
-  monthlyCapUsd: number;
-  slackWebhookUrl: string | null;
-  createdAt: string;
-  updatedAt: string;
-};
+export const dynamic = "force-dynamic";
 
-type UsagePayload = {
-  project: {
-    id: string;
-    name: string;
-    caps: {
-      daily: number;
-      weekly: number;
-      monthly: number;
-    };
-  };
-  spend: {
-    daily: number;
-    weekly: number;
-    monthly: number;
-  };
-  series: Array<{ day: string; spend: number }>;
-};
+export default async function ProjectPage({
+  params
+}: {
+  params: Promise<{ id: string }>;
+}) {
+  const session = await getSessionFromServerCookies();
 
-export default function ProjectPage() {
-  const params = useParams<{ id: string }>();
-  const router = useRouter();
-  const projectId = params.id;
-
-  const [project, setProject] = useState<Project | null>(null);
-  const [usage, setUsage] = useState<UsagePayload | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  const fetchAll = useCallback(async () => {
-    if (!projectId) {
-      return;
-    }
-
-    setLoading(true);
-    setError(null);
-
-    try {
-      const [projectRes, usageRes] = await Promise.all([
-        fetch(`/api/projects?id=${encodeURIComponent(projectId)}`, { cache: "no-store" }),
-        fetch(`/api/usage?projectId=${encodeURIComponent(projectId)}&days=45`, { cache: "no-store" })
-      ]);
-
-      if (!projectRes.ok) {
-        if (projectRes.status === 402) {
-          router.push("/dashboard?billing=required");
-          return;
-        }
-        setError("Project not found.");
-        return;
-      }
-
-      if (!usageRes.ok) {
-        setError("Could not load usage data.");
-        return;
-      }
-
-      const projectPayload = (await projectRes.json()) as { project: Project };
-      const usagePayload = (await usageRes.json()) as UsagePayload;
-
-      setProject(projectPayload.project);
-      setUsage(usagePayload);
-    } catch (fetchError) {
-      setError(fetchError instanceof Error ? fetchError.message : "Unexpected load error");
-    } finally {
-      setLoading(false);
-    }
-  }, [projectId, router]);
-
-  useEffect(() => {
-    void fetchAll();
-  }, [fetchAll]);
-
-  if (loading) {
-    return (
-      <main className="mx-auto max-w-6xl px-6 py-10 md:px-10">
-        <p className="text-sm text-slate-400">Loading project...</p>
-      </main>
-    );
+  if (!session) {
+    redirect("/");
   }
 
-  if (error || !project || !usage) {
-    return (
-      <main className="mx-auto max-w-6xl px-6 py-10 md:px-10">
-        <Link href="/dashboard" className="text-sm text-emerald-300 hover:text-emerald-200">
-          ← Back to dashboard
-        </Link>
-        <p className="mt-6 text-sm text-red-400">{error ?? "Project could not be loaded."}</p>
-      </main>
-    );
+  const activeSubscription = await hasActiveSubscription(session.email);
+
+  if (!activeSubscription) {
+    redirect(`/?email=${encodeURIComponent(session.email)}`);
   }
+
+  const resolvedParams = await params;
+  const project = await getProjectForOwner(session.email, resolvedParams.id);
+
+  if (!project) {
+    notFound();
+  }
+
+  const [totals, series] = await Promise.all([
+    getUsageTotals(project.id),
+    getDailyUsageSeries(project.id, 30)
+  ]);
+
+  const capStatus = evaluateCapStatus(project, totals);
 
   return (
-    <main className="mx-auto max-w-6xl space-y-8 px-6 py-10 md:px-10">
-      <header>
-        <Link href="/dashboard" className="text-sm text-emerald-300 hover:text-emerald-200">
-          ← Back to dashboard
-        </Link>
-        <h1 className="mt-3 text-3xl font-semibold">{project.name}</h1>
-        <p className="mt-1 text-sm text-slate-400">Proxy key prefix: {project.proxyKeyPrefix}…</p>
-      </header>
+    <main className="mx-auto min-h-screen w-full max-w-6xl px-4 pb-16 pt-10 md:px-6">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <Link href="/dashboard" className="text-sm text-[#9ca3af] transition hover:text-[#22c55e]">
+            ← Back to dashboard
+          </Link>
+          <h1 className="mt-2 text-3xl font-bold">{project.name}</h1>
+        </div>
+      </div>
 
-      <section className="grid gap-4 md:grid-cols-3">
-        <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-          <p className="text-xs uppercase tracking-[0.14em] text-slate-400">Daily spend</p>
-          <p className="mt-2 text-2xl font-semibold">${usage.spend.daily.toFixed(4)}</p>
-          <p className="text-xs text-slate-500">Cap ${usage.project.caps.daily.toFixed(2)}</p>
+      <section className="mt-6 grid gap-4 sm:grid-cols-3">
+        <div className="rounded-xl border border-[#1f2937] bg-[#111827]/80 p-4">
+          <div className="text-xs uppercase tracking-wide text-[#9ca3af]">Today</div>
+          <div className="mt-2 text-2xl font-bold">${totals.day.toFixed(3)}</div>
+          <div className="mt-1 text-xs text-[#9ca3af]">Cap ${project.dailyCapUsd.toFixed(2)}</div>
         </div>
-        <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-          <p className="text-xs uppercase tracking-[0.14em] text-slate-400">Weekly spend</p>
-          <p className="mt-2 text-2xl font-semibold">${usage.spend.weekly.toFixed(4)}</p>
-          <p className="text-xs text-slate-500">Cap ${usage.project.caps.weekly.toFixed(2)}</p>
+
+        <div className="rounded-xl border border-[#1f2937] bg-[#111827]/80 p-4">
+          <div className="text-xs uppercase tracking-wide text-[#9ca3af]">This Week</div>
+          <div className="mt-2 text-2xl font-bold">${totals.week.toFixed(3)}</div>
+          <div className="mt-1 text-xs text-[#9ca3af]">Cap ${project.weeklyCapUsd.toFixed(2)}</div>
         </div>
-        <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-          <p className="text-xs uppercase tracking-[0.14em] text-slate-400">Monthly spend</p>
-          <p className="mt-2 text-2xl font-semibold">${usage.spend.monthly.toFixed(4)}</p>
-          <p className="text-xs text-slate-500">Cap ${usage.project.caps.monthly.toFixed(2)}</p>
+
+        <div className="rounded-xl border border-[#1f2937] bg-[#111827]/80 p-4">
+          <div className="text-xs uppercase tracking-wide text-[#9ca3af]">This Month</div>
+          <div className="mt-2 text-2xl font-bold">${totals.month.toFixed(3)}</div>
+          <div className="mt-1 text-xs text-[#9ca3af]">Cap ${project.monthlyCapUsd.toFixed(2)}</div>
         </div>
       </section>
 
-      <UsageChart data={usage.series} dailyCapUsd={usage.project.caps.daily} />
+      {capStatus.exceeded.length > 0 ? (
+        <div className="mt-4 rounded-xl border border-[#7f1d1d] bg-[#450a0a]/50 p-4 text-sm text-[#fca5a5]">
+          Proxy is currently blocking requests. Exceeded windows:{" "}
+          {capStatus.exceeded.map((entry) => entry.window).join(", ")}.
+        </div>
+      ) : (
+        <div className="mt-4 rounded-xl border border-[#14532d] bg-[#052e16]/40 p-4 text-sm text-[#bbf7d0]">
+          Proxy is active. Remaining budget: Day ${capStatus.remaining.day.toFixed(2)}, Week $
+          {capStatus.remaining.week.toFixed(2)}, Month ${capStatus.remaining.month.toFixed(2)}.
+        </div>
+      )}
 
-      <section className="rounded-xl border border-slate-800 bg-slate-900/60 p-5">
-        <h2 className="text-lg font-semibold">Proxy endpoint</h2>
-        <p className="mt-2 text-sm text-slate-400">
-          Route requests to <code>/api/proxy</code> using your proxy key as Bearer auth. When caps are exceeded,
-          responses switch to <code>429</code> automatically.
-        </p>
-        <pre className="mt-3 overflow-x-auto rounded-md border border-slate-800 bg-slate-950 p-3 text-xs text-slate-300">
-{`curl https://your-domain.com/api/proxy \\
-  -H "Authorization: Bearer YOUR_PROXY_KEY" \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "model": "claude-3-5-sonnet-latest",
-    "max_tokens": 512,
-    "messages": [{"role":"user","content":"Summarize this log file"}]
-  }'`}
-        </pre>
+      <section className="mt-6 grid gap-5 lg:grid-cols-[1.1fr_1fr]">
+        <UsageChart data={series} />
+        <ProjectSettings project={project} />
       </section>
-
-      <ProjectSettings
-        mode="edit"
-        project={project}
-        onSaved={(result) => {
-          setProject(result.project);
-          void fetchAll();
-        }}
-      />
     </main>
   );
 }

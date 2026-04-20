@@ -1,58 +1,81 @@
-import { WebClient } from "@slack/web-api";
-import { markAlertSent, wasAlertSent } from "@/lib/usage-tracker";
+import axios from "axios";
+import { sqlOne } from "@/lib/db";
+import { getUsageWindows, type WindowType } from "@/lib/usage-tracker";
 
-type AlertInput = {
+function getWindowStart(window: WindowType, now: Date): Date {
+  const windows = getUsageWindows(now);
+
+  if (window === "day") {
+    return windows.dayStart;
+  }
+
+  if (window === "week") {
+    return windows.weekStart;
+  }
+
+  return windows.monthStart;
+}
+
+async function reserveAlertSlot(input: {
   projectId: string;
-  projectName: string;
-  periodType: "day" | "week" | "month";
-  periodKey: string;
-  currentSpendUsd: number;
+  windowType: WindowType;
+  windowStart: Date;
+}): Promise<boolean> {
+  const row = await sqlOne<{ id: string }>(
+    `
+    INSERT INTO alert_events (project_id, window_type, window_start)
+    VALUES ($1, $2, $3)
+    ON CONFLICT (project_id, window_type, window_start) DO NOTHING
+    RETURNING id
+    `,
+    [input.projectId, input.windowType, input.windowStart.toISOString()]
+  );
+
+  return Boolean(row);
+}
+
+export async function sendCapExceededAlert(input: {
+  project: {
+    id: string;
+    name: string;
+    slackWebhookUrl: string | null;
+  };
+  windowType: WindowType;
+  totalUsd: number;
   capUsd: number;
-  slackWebhookUrl: string | null;
-};
+}): Promise<{ sent: boolean; reason?: string }> {
+  const webhook = input.project.slackWebhookUrl;
 
-async function postWebhookAlert(webhookUrl: string, text: string) {
-  await fetch(webhookUrl, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ text })
-  });
-}
-
-async function postBotAlert(text: string) {
-  const token = process.env.SLACK_BOT_TOKEN;
-  const channel = process.env.SLACK_ALERT_CHANNEL;
-  if (!token || !channel) {
-    return;
+  if (!webhook) {
+    return { sent: false, reason: "No Slack webhook configured" };
   }
 
-  const client = new WebClient(token);
-  await client.chat.postMessage({
-    channel,
-    text
+  const now = new Date();
+  const windowStart = getWindowStart(input.windowType, now);
+  const reserved = await reserveAlertSlot({
+    projectId: input.project.id,
+    windowType: input.windowType,
+    windowStart
   });
-}
 
-export async function sendCapAlertIfNeeded(input: AlertInput) {
-  if (wasAlertSent(input.projectId, input.periodType, input.periodKey)) {
-    return;
+  if (!reserved) {
+    return { sent: false, reason: "Alert already sent for this cap window" };
   }
 
-  const text = [
-    `Claude Usage Cap: limit reached for project "${input.projectName}"`,
-    `Period: ${input.periodType} (${input.periodKey})`,
-    `Spend: $${input.currentSpendUsd.toFixed(2)} / $${input.capUsd.toFixed(2)}`,
-    "Proxy is returning 429 until the period resets."
-  ].join("\n");
+  const windowLabel = input.windowType.toUpperCase();
 
-  try {
-    if (input.slackWebhookUrl) {
-      await postWebhookAlert(input.slackWebhookUrl, text);
-    } else {
-      await postBotAlert(text);
+  await axios.post(
+    webhook,
+    {
+      text: `:rotating_light: Claude Usage Cap triggered for *${input.project.name}* (${input.project.id}).\n*${windowLabel}* cap: $${input.capUsd.toFixed(2)}\nCurrent spend: $${input.totalUsd.toFixed(2)}\nFurther proxy requests are blocked with HTTP 429 until the next ${input.windowType} window starts.`
+    },
+    {
+      timeout: 10_000,
+      headers: {
+        "Content-Type": "application/json"
+      }
     }
-    markAlertSent(input.projectId, input.periodType, input.periodKey);
-  } catch (error) {
-    console.error("Failed to send Slack alert", error);
-  }
+  );
+
+  return { sent: true };
 }
